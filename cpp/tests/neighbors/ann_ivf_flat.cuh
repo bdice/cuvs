@@ -515,7 +515,7 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
 
  private:
   raft::resources handle_;
-  rmm::cuda_stream_view stream_;
+  cuda::stream_ref stream_;
   AnnIvfFlatInputs<IdxT> ps;
   rmm::device_uvector<DataT> database;
   rmm::device_uvector<DataT> search_queries;

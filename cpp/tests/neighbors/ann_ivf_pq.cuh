@@ -705,7 +705,7 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
 
  private:
   raft::resources handle_;
-  rmm::cuda_stream_view stream_;
+  cuda::stream_ref stream_;
   ivf_pq_inputs ps;                           // NOLINT
   rmm::device_uvector<DataT> database;        // NOLINT
   rmm::device_uvector<DataT> search_queries;  // NOLINT
@@ -867,7 +867,7 @@ class ivf_pq_filter_test : public ::testing::TestWithParam<ivf_pq_inputs> {
 
  private:
   raft::resources handle_;
-  rmm::cuda_stream_view stream_;
+  cuda::stream_ref stream_;
   ivf_pq_inputs ps;                           // NOLINT
   rmm::device_uvector<DataT> database;        // NOLINT
   rmm::device_uvector<DataT> search_queries;  // NOLINT

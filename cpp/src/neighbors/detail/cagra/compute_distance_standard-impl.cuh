@@ -133,7 +133,7 @@ standard_descriptor_spec<Metric, TeamSize, DatasetBlockDim, DataT, IndexT, Dista
 
   return host_type{desc_type{ptr, size, dim, ld, dataset_norms},
                    [=](dataset_descriptor_base_t<DataT, IndexT, DistanceT>* dev_ptr,
-                       rmm::cuda_stream_view stream) {
+                       cuda::stream_ref stream) {
                      standard_dataset_descriptor_init_kernel<Metric,
                                                              TeamSize,
                                                              DatasetBlockDim,

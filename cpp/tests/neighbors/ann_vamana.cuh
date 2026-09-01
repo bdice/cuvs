@@ -299,7 +299,7 @@ class AnnVamanaTest : public ::testing::TestWithParam<AnnVamanaInputs> {
 
  private:
   raft::resources handle_;
-  rmm::cuda_stream_view stream_;
+  cuda::stream_ref stream_;
   AnnVamanaInputs ps;
   rmm::device_uvector<DataT> database;
   rmm::device_uvector<DataT> search_queries;
