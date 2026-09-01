@@ -162,7 +162,7 @@ class NNTest : public ::testing::TestWithParam<NNInputs<IdxT>> {
 
  private:
   raft::resources handle;
-  rmm::cuda_stream_view stream;
+  cuda::stream_ref stream;
   NNInputs<IdxT> params_;
   ComparisonSummary summary;
   IdxT m;

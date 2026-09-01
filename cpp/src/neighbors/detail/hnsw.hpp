@@ -1097,7 +1097,6 @@ from_cagra(raft::resources const& res,
            std::optional<raft::host_matrix_view<const T, int64_t, raft::row_major>> dataset)
 {
   common::nvtx::range<common::nvtx::domain::cuvs> fun_scope("hnsw::from_cagra<GPU>");
-  auto stream = raft::resource::get_cuda_stream(res);
   auto num_threads =
     params.num_threads == 0 ? cuvs::core::omp::get_max_threads() : params.num_threads;
 

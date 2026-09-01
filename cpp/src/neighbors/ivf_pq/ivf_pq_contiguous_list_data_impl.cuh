@@ -72,7 +72,7 @@ inline void unpack_contiguous_list_data_impl(
   uint32_t pq_dim,
   std::variant<uint32_t, const uint32_t*> offset_or_indices,
   uint32_t pq_bits,
-  rmm::cuda_stream_view stream)
+  cuda::stream_ref stream)
 {
   if (n_rows == 0) { return; }
 
@@ -154,7 +154,7 @@ inline void pack_contiguous_list_data_impl(
   uint32_t pq_dim,
   std::variant<uint32_t, const uint32_t*> offset_or_indices,
   uint32_t pq_bits,
-  rmm::cuda_stream_view stream)
+  cuda::stream_ref stream)
 {
   if (n_rows == 0) { return; }
 

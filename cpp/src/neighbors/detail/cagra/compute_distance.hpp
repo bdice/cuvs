@@ -211,9 +211,8 @@ struct dataset_descriptor_host {
   // Codebook type is determined by DataT for VPQ (always half for now)
 
   struct state {
-    using ready_t = std::tuple<dev_descriptor_t*, rmm::cuda_stream_view>;
-    using init_f =
-      std::tuple<std::function<void(dev_descriptor_t*, rmm::cuda_stream_view)>, size_t>;
+    using ready_t = std::tuple<dev_descriptor_t*, cuda::stream_ref>;
+    using init_f  = std::tuple<std::function<void(dev_descriptor_t*, cuda::stream_ref)>, size_t>;
 
     std::mutex mutex;
     std::atomic<bool> ready;  // Not sure if std::holds_alternative is thread-safe
@@ -235,7 +234,7 @@ struct dataset_descriptor_host {
       RAFT_CUDA_TRY_NO_THROW(cudaEventDestroy(ready_event));
     }
 
-    void eval(rmm::cuda_stream_view stream)
+    void eval(cuda::stream_ref stream)
     {
       std::lock_guard<std::mutex> lock(mutex);
       if (std::holds_alternative<init_f>(value)) {
@@ -249,7 +248,7 @@ struct dataset_descriptor_host {
       }
     }
 
-    auto get(rmm::cuda_stream_view stream) -> dev_descriptor_t*
+    auto get(cuda::stream_ref stream) -> dev_descriptor_t*
     {
       if (!ready.load(std::memory_order_acquire)) { eval(stream); }
       // value is immutable at this point.
@@ -286,12 +285,12 @@ struct dataset_descriptor_host {
   /**
    * Return the device pointer, possibly evaluating it in the given thread.
    */
-  [[nodiscard]] auto dev_ptr(rmm::cuda_stream_view stream) const -> const dev_descriptor_t*
+  [[nodiscard]] auto dev_ptr(cuda::stream_ref stream) const -> const dev_descriptor_t*
   {
     return value_->get(stream);
   }
 
-  [[nodiscard]] auto dev_ptr(rmm::cuda_stream_view stream) -> dev_descriptor_t*
+  [[nodiscard]] auto dev_ptr(cuda::stream_ref stream) -> dev_descriptor_t*
   {
     return value_->get(stream);
   }

@@ -235,7 +235,7 @@ auto calculate_offsets_and_indices(IdxT n_rows,
                                    const uint32_t* cluster_sizes,
                                    IdxT* cluster_offsets,
                                    IdxT* data_indices,
-                                   rmm::cuda_stream_view stream) -> uint32_t
+                                   cuda::stream_ref stream) -> uint32_t
 {
   auto exec_policy = rmm::exec_policy(stream);
   // Calculate the offsets
