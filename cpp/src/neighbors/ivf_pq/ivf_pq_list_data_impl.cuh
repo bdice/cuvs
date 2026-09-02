@@ -5,6 +5,7 @@
 
 #pragma once
 #include "ivf_pq_codepacking.cuh"
+#include <cuda/stream>
 #include <cuvs/neighbors/ivf_pq.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/util/cuda_dev_essentials.cuh>

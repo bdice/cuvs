@@ -21,7 +21,7 @@
 #include <raft/util/pow2_utils.cuh>          // raft::Pow2
 #include <raft/util/vectorized.cuh>          // raft::TxN_t
 
-#include <rmm/cuda_stream_view.hpp>  // cuda::stream_ref
+#include <cuda/stream>  // cuda::stream_ref
 
 namespace cuvs::neighbors::ivf_pq::detail {
 

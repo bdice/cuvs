@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cuda/stream>
 #include <cuvs/distance/distance.hpp>
 #include <raft/core/copy.cuh>
 #include <raft/core/device_mdspan.hpp>

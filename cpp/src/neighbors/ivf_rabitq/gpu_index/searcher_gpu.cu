@@ -16,6 +16,7 @@
 #include "searcher_gpu.cuh"
 #include "searcher_gpu_common.cuh"
 
+#include <cuda/stream>
 #include <cuvs/selection/select_k.hpp>
 #include <raft/matrix/detail/select_warpsort.cuh>
 

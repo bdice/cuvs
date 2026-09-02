@@ -16,6 +16,7 @@
 #include <cuvs/neighbors/common.hpp>
 #include <cuvs/neighbors/ivf_sq.hpp>
 
+#include <cuda/stream>
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/selection/select_k.hpp>
 #include <raft/core/device_mdarray.hpp>

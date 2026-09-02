@@ -5,6 +5,7 @@
 
 #include "ivf_common.cuh"
 
+#include <cuda/stream>
 #include <raft/util/cudart_utils.hpp>
 #include <raft/util/pow2_utils.cuh>
 
