@@ -232,7 +232,7 @@ inline void memzero(T* ptr, IdxT n_elems, rmm::cuda_stream_view stream)
       RAFT_CUDA_TRY(cudaMemsetAsync(ptr, 0, n_elems * sizeof(T), stream));
     } break;
     case pointer_residency::host_only: {
-      stream.synchronize();
+      stream.sync();
       ::memset(ptr, 0, n_elems * sizeof(T));
     } break;
     default: RAFT_FAIL("memset: unreachable code");
@@ -302,7 +302,7 @@ void block_copy(const IdxT* in_offsets,
 {
   IdxT in_size;
   update_host(&in_size, in_offsets + n_blocks, 1, stream);
-  stream.synchronize();
+  stream.sync();
   dim3 threads(128, 1, 1);
   dim3 blocks(raft::ceildiv<IdxT>(in_size * n_mult, threads.x), 1, 1);
   block_copy_kernel<<<blocks, threads, 0, stream>>>(
@@ -381,14 +381,14 @@ void copy_selected(IdxT n_rows,
         <<<grid_dim, block_dim, 0, stream>>>(n_rows, n_cols, src, row_ids, ld_src, dst, ld_dst);
     } break;
     case pointer_residency::host_only: {
-      stream.synchronize();
+      stream.sync();
       for (IdxT i_dst = 0; i_dst < n_rows; i_dst++) {
         auto i_src = static_cast<IdxT>(row_ids[i_dst]);
         for (IdxT j = 0; j < n_cols; j++) {
           dst[ld_dst * i_dst + j] = mapping<T>{}(src[ld_src * i_src + j]);
         }
       }
-      stream.synchronize();
+      stream.sync();
     } break;
     default: RAFT_FAIL("All pointers must reside on the same side, host or device.");
   }
@@ -535,7 +535,7 @@ struct batch_load_iterator {
       }
       // Stream is shared with the iterator; it must be sync'd before the underlying buffers (or,
       // in the passthrough case, the source mdspan) can be safely reused.
-      copy_stream_.synchronize();
+      copy_stream_.sync();
     }
 
     [[nodiscard]] auto row_width() const -> size_type { return row_width_; }
@@ -703,7 +703,7 @@ struct batch_load_iterator {
           prefetch_pos_.reset();
           // Ensure prefetch_next_batch()'s queued H2D into this slot (and any prior D2H of the
           // slot from the previous overwrite) finished before the user kernel reads it.
-          copy_stream_.synchronize();
+          copy_stream_.sync();
         } else {
           // Non-pipelined fast path (prefetch_=false, or prefetch_pos_ didn't match).
           if (host_writeback_ && dirty_cur_ && pos_.has_value()) {
@@ -711,7 +711,7 @@ struct batch_load_iterator {
             dirty_cur_ = false;
           }
           if (initialize_) { queue_h2d(dev_ptr_, row_offset, len); }
-          copy_stream_.synchronize();
+          copy_stream_.sync();
         }
         pos_.emplace(pos);
         batch_len_ = len;
