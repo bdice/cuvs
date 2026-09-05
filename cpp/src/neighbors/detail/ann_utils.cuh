@@ -229,7 +229,7 @@ inline void memzero(T* ptr, IdxT n_elems, rmm::cuda_stream_view stream)
   switch (check_pointer_residency(ptr)) {
     case pointer_residency::host_and_device:
     case pointer_residency::device_only: {
-      RAFT_CUDA_TRY(cudaMemsetAsync(ptr, 0, n_elems * sizeof(T), stream));
+      RAFT_CUDA_TRY(cudaMemsetAsync(ptr, 0, n_elems * sizeof(T), stream.get()));
     } break;
     case pointer_residency::host_only: {
       stream.sync();
@@ -305,7 +305,7 @@ void block_copy(const IdxT* in_offsets,
   stream.sync();
   dim3 threads(128, 1, 1);
   dim3 blocks(raft::ceildiv<IdxT>(in_size * n_mult, threads.x), 1, 1);
-  block_copy_kernel<<<blocks, threads, 0, stream>>>(
+  block_copy_kernel<<<blocks, threads, 0, stream.get()>>>(
     in_offsets, out_offsets, n_blocks, in_data, out_data, n_mult);
 }
 
@@ -329,7 +329,7 @@ void outer_add(const T* a, IdxT len_a, const T* b, IdxT len_b, T* c, rmm::cuda_s
 {
   dim3 threads(128, 1, 1);
   dim3 blocks(raft::ceildiv<IdxT>(len_a * len_b, threads.x), 1, 1);
-  outer_add_kernel<<<blocks, threads, 0, stream>>>(a, len_a, b, len_b, c);
+  outer_add_kernel<<<blocks, threads, 0, stream.get()>>>(a, len_a, b, len_b, c);
 }
 
 template <typename T, typename S, typename IdxT, typename LabelT>
@@ -378,7 +378,7 @@ void copy_selected(IdxT n_rows,
       IdxT block_dim = 128;
       IdxT grid_dim  = raft::ceildiv(n_rows * n_cols, block_dim);
       copy_selected_kernel<T, S>
-        <<<grid_dim, block_dim, 0, stream>>>(n_rows, n_cols, src, row_ids, ld_src, dst, ld_dst);
+        <<<grid_dim, block_dim, 0, stream.get()>>>(n_rows, n_cols, src, row_ids, ld_src, dst, ld_dst);
     } break;
     case pointer_residency::host_only: {
       stream.sync();
@@ -789,7 +789,7 @@ struct batch_load_iterator {
                                     source_ + src_row_offset * row_width_,
                                     n_bytes,
                                     cudaMemcpyHostToDevice,
-                                    copy_stream_));
+                                    copy_stream_.get()));
     }
 
     void queue_d2h(element_type* src, size_type pos)
@@ -803,7 +803,7 @@ struct batch_load_iterator {
                                     src,
                                     n_bytes,
                                     cudaMemcpyDeviceToHost,
-                                    copy_stream_));
+                                    copy_stream_.get()));
     }
 
     rmm::cuda_stream_view copy_stream_;
