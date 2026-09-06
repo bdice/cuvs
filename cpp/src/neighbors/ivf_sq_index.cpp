@@ -46,8 +46,6 @@ index<CodeT>::index(raft::resources const& res,
   check_consistency();
   auto stream = raft::resource::get_cuda_stream(res);
   std::memset(accum_sorted_sizes_.data_handle(), 0, accum_sorted_sizes_.size() * sizeof(int64_t));
-  RAFT_CUDA_TRY(cudaMemsetAsync(
-    list_sizes_.data_handle(), 0, list_sizes_.size() * sizeof(uint32_t), stream.get()));
   RAFT_CUDA_TRY(
     cudaMemsetAsync(data_ptrs_.data_handle(), 0, data_ptrs_.size() * sizeof(CodeT*), stream.get()));
   RAFT_CUDA_TRY(cudaMemsetAsync(
