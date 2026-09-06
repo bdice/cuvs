@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <gtest/gtest.h>
 #include <cuda/stream>
+
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/handle.hpp>
 #include <raft/random/rng.cuh>
