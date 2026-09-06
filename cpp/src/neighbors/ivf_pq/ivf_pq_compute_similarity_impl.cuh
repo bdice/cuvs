@@ -317,7 +317,7 @@ void compute_similarity_run(selected<OutT, LutT> s,
                                                                        lut_scores,
                                                                        _out_scores,
                                                                        _out_indices);
-  RAFT_CHECK_CUDA(stream);
+  RAFT_CHECK_CUDA(stream.get());
 }
 
 /**

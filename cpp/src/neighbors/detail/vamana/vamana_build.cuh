@@ -578,7 +578,7 @@ void batched_insert_vamana(
 
   raft::copy(graph.data_handle(), d_graph.data_handle(), d_graph.size(), stream);
 
-  RAFT_CHECK_CUDA(stream);
+  RAFT_CHECK_CUDA(stream.get());
 }
 
 template <typename T,
