@@ -38,7 +38,6 @@
 #include <raft/util/pow2_utils.cuh>
 #include <raft/util/vectorized.cuh>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cub/device/device_radix_sort.cuh>

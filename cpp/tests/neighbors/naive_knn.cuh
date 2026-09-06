@@ -11,7 +11,6 @@
 #include <raft/util/cuda_utils.cuh>
 
 #include <raft/core/resource/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
