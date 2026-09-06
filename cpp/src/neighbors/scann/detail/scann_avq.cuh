@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -280,7 +280,8 @@ void compute_avq_centroid(raft::resources const& dev_resources,
 
   raft::linalg::detail::cublas_device_pointer_mode<true> pm(cublas_handle);
 
-  RAFT_CUBLAS_TRY(cublasSetStream(cublas_handle, raft::resource::get_cuda_stream(dev_resources).get()));
+  RAFT_CUBLAS_TRY(
+    cublasSetStream(cublas_handle, raft::resource::get_cuda_stream(dev_resources).get()));
 
   RAFT_CUBLAS_TRY(cublasSgemm(cublas_handle,
                               cublasOperation_t::CUBLAS_OP_T,

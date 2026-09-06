@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -221,8 +221,9 @@ class sparse_knn_t {
         idx_batch_indices.resize(idx_batch_nnz, raft::resource::get_cuda_stream(handle));
         idx_batch_data.resize(idx_batch_nnz, raft::resource::get_cuda_stream(handle));
 
-        idx_batcher.get_batch_csr_indices_data(
-          idx_batch_indices.data(), idx_batch_data.data(), raft::resource::get_cuda_stream(handle).get());
+        idx_batcher.get_batch_csr_indices_data(idx_batch_indices.data(),
+                                               idx_batch_data.data(),
+                                               raft::resource::get_cuda_stream(handle).get());
 
         /**
          * Compute distances
@@ -253,8 +254,10 @@ class sparse_knn_t {
         // populate batch indices array
         value_idx batch_rows = query_batcher.batch_rows(), batch_cols = idx_batcher.batch_rows();
 
-        iota_fill(
-          batch_indices.data(), batch_rows, batch_cols, raft::resource::get_cuda_stream(handle).get());
+        iota_fill(batch_indices.data(),
+                  batch_rows,
+                  batch_cols,
+                  raft::resource::get_cuda_stream(handle).get());
 
         /**
          * Perform k-selection on batch & merge with other k-selections

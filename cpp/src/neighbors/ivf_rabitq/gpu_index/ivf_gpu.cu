@@ -514,8 +514,12 @@ void IVFGPU::construct_on_gpu(const float* device_data,
   rmm::device_uvector<size_t> d_offsets(num_centroids + 1, stream_);
 
   temp_storage_bytes = 0;
-  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    nullptr, temp_storage_bytes, d_histogram.data(), d_offsets.data(), num_centroids, stream_.get()));
+  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(nullptr,
+                                              temp_storage_bytes,
+                                              d_histogram.data(),
+                                              d_offsets.data(),
+                                              num_centroids,
+                                              stream_.get()));
 
   {
     rmm::device_buffer d_temp_storage(temp_storage_bytes, stream_);
@@ -709,10 +713,10 @@ void IVFGPU::construct_on_gpu_streaming(const float* host_data,
 
   num_blocks = (num_vectors + block_size - 1) / block_size;
   scatter_pids_kernel<<<num_blocks, block_size, 0, stream_.get()>>>(d_flat_pids,
-                                                              device_cluster_ids,
-                                                              d_offsets.data_handle(),
-                                                              d_atomic_counters.data_handle(),
-                                                              num_vectors);
+                                                                    device_cluster_ids,
+                                                                    d_offsets.data_handle(),
+                                                                    d_atomic_counters.data_handle(),
+                                                                    num_vectors);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   // -------------------------

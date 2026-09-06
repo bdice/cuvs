@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -183,8 +183,11 @@ class BallCoverKNNQueryTest : public ::testing::TestWithParam<BallCoverInputs<va
     if (metric == cuvs::distance::DistanceType::Haversine) {
       raft::linalg::unaryOp(
         X.data(), X.data(), X.size(), ToRadians(), raft::resource::get_cuda_stream(handle).get());
-      raft::linalg::unaryOp(
-        X2.data(), X2.data(), X2.size(), ToRadians(), raft::resource::get_cuda_stream(handle).get());
+      raft::linalg::unaryOp(X2.data(),
+                            X2.data(),
+                            X2.size(),
+                            ToRadians(),
+                            raft::resource::get_cuda_stream(handle).get());
     }
 
     compute_bfknn(handle,

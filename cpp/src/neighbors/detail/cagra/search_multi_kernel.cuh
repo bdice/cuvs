@@ -422,8 +422,13 @@ struct search
       if (input_keys_storage.size() != sizeBatch * numElements) {
         input_keys_storage.resize(sizeBatch * numElements, stream);
       }
-      batched_memcpy(
-        input_keys_storage.data(), numElements, inputKeys, ldIK, numElements, sizeBatch, stream.get());
+      batched_memcpy(input_keys_storage.data(),
+                     numElements,
+                     inputKeys,
+                     ldIK,
+                     numElements,
+                     sizeBatch,
+                     stream.get());
       inputKeys = input_keys_storage.data();
     }
 
@@ -432,8 +437,13 @@ struct search
         input_values_storage.resize(sizeBatch * numElements, stream);
       }
 
-      batched_memcpy(
-        input_values_storage.data(), numElements, inputVals, ldIV, numElements, sizeBatch, stream.get());
+      batched_memcpy(input_values_storage.data(),
+                     numElements,
+                     inputVals,
+                     ldIV,
+                     numElements,
+                     sizeBatch,
+                     stream.get());
       inputVals = input_values_storage.data();
     }
 
@@ -457,11 +467,13 @@ struct search
       sort);
 
     if (ldOK > topK) {
-      batched_memcpy(outputKeys, ldOK, output_keys_storage.data(), topK, topK, sizeBatch, stream.get());
+      batched_memcpy(
+        outputKeys, ldOK, output_keys_storage.data(), topK, topK, sizeBatch, stream.get());
     }
 
     if (ldOV > topK) {
-      batched_memcpy(outputVals, ldOV, output_values_storage.data(), topK, topK, sizeBatch, stream.get());
+      batched_memcpy(
+        outputVals, ldOV, output_values_storage.data(), topK, topK, sizeBatch, stream.get());
     }
   }
 

@@ -630,13 +630,14 @@ void reconstruct_list_data(raft::resources const& res,
       default: RAFT_FAIL("Invalid pq_bits (%u), the value must be within [4, 8]", pq_bits);
     }
   }(index.pq_bits());
-  kernel<<<blocks, threads, 0, raft::resource::get_cuda_stream(res).get()>>>(tmp.view(),
-                                                                       typed_list->data.view(),
-                                                                       index.pq_centers(),
-                                                                       index.centers_rot(),
-                                                                       index.codebook_kind(),
-                                                                       label,
-                                                                       offset_or_indices);
+  kernel<<<blocks, threads, 0, raft::resource::get_cuda_stream(res).get()>>>(
+    tmp.view(),
+    typed_list->data.view(),
+    index.pq_centers(),
+    index.centers_rot(),
+    index.codebook_kind(),
+    label,
+    offset_or_indices);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   float* out_float_ptr = nullptr;

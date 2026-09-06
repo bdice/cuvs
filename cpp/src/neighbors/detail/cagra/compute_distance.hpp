@@ -254,7 +254,9 @@ struct dataset_descriptor_host {
       if (!ready.load(std::memory_order_acquire)) { eval(stream); }
       // value is immutable at this point.
       auto& [ptr, ready_stream] = std::get<ready_t>(value);
-      if (ready_stream != stream) { RAFT_CUDA_TRY(cudaStreamWaitEvent(stream.get(), ready_event, 0)); }
+      if (ready_stream != stream) {
+        RAFT_CUDA_TRY(cudaStreamWaitEvent(stream.get(), ready_event, 0));
+      }
       return ptr;
     }
   };

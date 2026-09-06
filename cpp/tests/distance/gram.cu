@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -140,8 +140,11 @@ class GramMatrixTest : public ::testing::TestWithParam<GramMatrixInputs> {
                           stream.get(),
                           handle);
 
-    ASSERT_TRUE(cuvs::devArrMatchHost(
-      gram_host.data(), gram.data(), gram.size(), cuvs::CompareApprox<math_t>(1e-6f), stream.get()));
+    ASSERT_TRUE(cuvs::devArrMatchHost(gram_host.data(),
+                                      gram.data(),
+                                      gram.size(),
+                                      cuvs::CompareApprox<math_t>(1e-6f),
+                                      stream.get()));
   }
 
   GramMatrixInputs params;

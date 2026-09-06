@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -121,7 +121,8 @@ void launchPrecomputeLUTs(const float* d_query,
   dim3 gridDim(num_queries, 1, 1);
   dim3 blockDim(256, 1, 1);  // Can tune this
 
-  precomputeAllLUTs<<<gridDim, blockDim, 0, stream.get()>>>(d_query, d_lut_for_queries, num_queries, D);
+  precomputeAllLUTs<<<gridDim, blockDim, 0, stream.get()>>>(
+    d_query, d_lut_for_queries, num_queries, D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 

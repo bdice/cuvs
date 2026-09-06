@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -132,8 +132,8 @@ class SpectralClusteringTest : public ::testing::TestWithParam<SpectralClusterin
 
     raft::resource::sync_stream(handle, stream);
 
-    score =
-      raft::stats::adjusted_rand_index(d_labels_ref.data(), d_labels.data(), n_samples, stream.get());
+    score = raft::stats::adjusted_rand_index(
+      d_labels_ref.data(), d_labels.data(), n_samples, stream.get());
 
     if (score < 0.8) {
       std::stringstream ss;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -526,13 +526,14 @@ void data_transformation_batch_opt(const float* d_data,
   size_t sharedMemSize = FusedBlockSize * sizeof(float);
 
   subtract_normalize_binarize_Kernel<FusedBlockSize>
-    <<<gridDim, blockDim, sharedMemSize, stream.get()>>>(d_XP,         // Input: Rotated data
-                                                   d_CP,         // Input: Rotated centroid
-                                                   d_XP_output,  // Output 1: Final residuals
-                                                   d_XP_norm,    // Output 2: Normalized residuals
-                                                   d_bin_XP,     // Output 3: Binarized data
-                                                   num_points,
-                                                   D);
+    <<<gridDim, blockDim, sharedMemSize, stream.get()>>>(
+      d_XP,         // Input: Rotated data
+      d_CP,         // Input: Rotated centroid
+      d_XP_output,  // Output 1: Final residuals
+      d_XP_norm,    // Output 2: Normalized residuals
+      d_bin_XP,     // Output 3: Binarized data
+      num_points,
+      D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
@@ -593,16 +594,16 @@ void exrabitq_codes_and_factors_fused(const int* d_bin_XP,
 
   exrabitq_fused_kernel_batch<BlockSize>
     <<<gridDim, blockDim, shared_mem_size, stream.get()>>>(d_bin_XP,
-                                                     d_XP_norm,
-                                                     d_XP,
-                                                     d_centroid,
-                                                     num_points,
-                                                     D,
-                                                     EX_BITS,
-                                                     const_scaling_factor,
-                                                     1.9f,  // kConstEpsilon
-                                                     d_long_code,
-                                                     d_ex_factor);
+                                                           d_XP_norm,
+                                                           d_XP,
+                                                           d_centroid,
+                                                           num_points,
+                                                           D,
+                                                           EX_BITS,
+                                                           const_scaling_factor,
+                                                           1.9f,  // kConstEpsilon
+                                                           d_long_code,
+                                                           d_ex_factor);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   raft::resource::sync_stream(handle);
 }
@@ -719,13 +720,14 @@ void data_transformation_batch_opt_contiguous(const float* d_contiguous_data,
   size_t sharedMemSize = FusedBlockSize * sizeof(float);
 
   subtract_normalize_binarize_Kernel<FusedBlockSize>
-    <<<gridDim, blockDim, sharedMemSize, stream.get()>>>(d_XP,         // Input: Rotated data
-                                                   d_CP,         // Input: Rotated centroid
-                                                   d_XP_output,  // Output 1: Final residuals
-                                                   d_XP_norm,    // Output 2: Normalized residuals
-                                                   d_bin_XP,     // Output 3: Binarized data
-                                                   num_points,
-                                                   D);
+    <<<gridDim, blockDim, sharedMemSize, stream.get()>>>(
+      d_XP,         // Input: Rotated data
+      d_CP,         // Input: Rotated centroid
+      d_XP_output,  // Output 1: Final residuals
+      d_XP_norm,    // Output 2: Normalized residuals
+      d_bin_XP,     // Output 3: Binarized data
+      num_points,
+      D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
@@ -1257,15 +1259,15 @@ void exrabitq_codes_and_factors_fused_ori(const int* d_bin_XP,
 
   exrabitq_fused_kernel_batch_ori<BlockSize>
     <<<gridDim, blockDim, shared_mem_size, stream.get()>>>(d_bin_XP,
-                                                     d_XP_norm,
-                                                     d_XP,
-                                                     d_centroid,
-                                                     num_points,
-                                                     D,
-                                                     EX_BITS,
-                                                     1.9f,  // kConstEpsilon
-                                                     d_long_code,
-                                                     d_ex_factor);
+                                                           d_XP_norm,
+                                                           d_XP,
+                                                           d_centroid,
+                                                           num_points,
+                                                           D,
+                                                           EX_BITS,
+                                                           1.9f,  // kConstEpsilon
+                                                           d_long_code,
+                                                           d_ex_factor);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   raft::resource::sync_stream(handle);
 }

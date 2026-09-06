@@ -233,12 +233,12 @@ vpq_descriptor_spec<Metric,
                                          IndexT,
                                          DistanceT,
                                          SmemDType><<<1, 1, 0, stream.get()>>>(dev_ptr,
-                                                                         encoded_dataset_ptr,
-                                                                         encoded_dataset_dim,
-                                                                         vq_code_book_ptr,
-                                                                         pq_code_book_ptr,
-                                                                         size,
-                                                                         dim);
+                                                                               encoded_dataset_ptr,
+                                                                               encoded_dataset_dim,
+                                                                               vq_code_book_ptr,
+                                                                               pq_code_book_ptr,
+                                                                               size,
+                                                                               dim);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     },
     Metric,

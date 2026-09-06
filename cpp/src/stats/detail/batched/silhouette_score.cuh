@@ -116,7 +116,8 @@ rmm::device_uvector<value_idx> get_cluster_counts(raft::resources const& handle,
 
   rmm::device_uvector<char> workspace(1, stream);
 
-  cuvs::stats::detail::countLabels(y, cluster_counts.data(), n_rows, n_labels, workspace, stream.get());
+  cuvs::stats::detail::countLabels(
+    y, cluster_counts.data(), n_rows, n_labels, workspace, stream.get());
 
   return cluster_counts;
 }

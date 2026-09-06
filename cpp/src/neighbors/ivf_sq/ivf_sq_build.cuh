@@ -386,17 +386,17 @@ void extend_inplace(raft::resources const& handle,
       const dim3 grid_dim(raft::ceildiv<int64_t>(bs, int64_t(kEncodeWarpsPerBlk)));
       encode_and_fill_kernel<kEncodeBlockSize, T>
         <<<grid_dim, block_dim, 0, stream.get()>>>(new_labels.data_handle() + batch.offset(),
-                                             batch.data(),
-                                             index->centers().data_handle(),
-                                             idx_batch->data(),
-                                             index->data_ptrs().data_handle(),
-                                             index->inds_ptrs().data_handle(),
-                                             list_sizes_ptr,
-                                             index->sq_vmin().data_handle(),
-                                             index->sq_delta().data_handle(),
-                                             bs,
-                                             dim,
-                                             batch.offset());
+                                                   batch.data(),
+                                                   index->centers().data_handle(),
+                                                   idx_batch->data(),
+                                                   index->data_ptrs().data_handle(),
+                                                   index->inds_ptrs().data_handle(),
+                                                   list_sizes_ptr,
+                                                   index->sq_vmin().data_handle(),
+                                                   index->sq_delta().data_handle(),
+                                                   bs,
+                                                   dim,
+                                                   batch.offset());
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
 
@@ -422,8 +422,11 @@ void extend_inplace(raft::resources const& handle,
                                                         stream.get(),
                                                         raft::sqrt_op{});
     } else {
-      raft::linalg::rowNorm<raft::linalg::L2Norm, true>(
-        index->center_norms()->data_handle(), index->centers().data_handle(), dim, n_lists, stream.get());
+      raft::linalg::rowNorm<raft::linalg::L2Norm, true>(index->center_norms()->data_handle(),
+                                                        index->centers().data_handle(),
+                                                        dim,
+                                                        n_lists,
+                                                        stream.get());
     }
   };
 
@@ -493,10 +496,10 @@ inline auto build(
       constexpr int kResidualBlockSize = 256;
       compute_residuals_inplace_kernel<T>
         <<<n_rows_train, kResidualBlockSize, 0, stream.get()>>>(trainset.data_handle(),
-                                                          idx.centers().data_handle(),
-                                                          train_labels.data_handle(),
-                                                          n_rows_train,
-                                                          dim);
+                                                                idx.centers().data_handle(),
+                                                                train_labels.data_handle(),
+                                                                n_rows_train,
+                                                                dim);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
 

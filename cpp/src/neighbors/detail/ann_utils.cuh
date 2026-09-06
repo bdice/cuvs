@@ -377,8 +377,8 @@ void copy_selected(IdxT n_rows,
     case pointer_residency::device_only: {
       IdxT block_dim = 128;
       IdxT grid_dim  = raft::ceildiv(n_rows * n_cols, block_dim);
-      copy_selected_kernel<T, S>
-        <<<grid_dim, block_dim, 0, stream.get()>>>(n_rows, n_cols, src, row_ids, ld_src, dst, ld_dst);
+      copy_selected_kernel<T, S><<<grid_dim, block_dim, 0, stream.get()>>>(
+        n_rows, n_cols, src, row_ids, ld_src, dst, ld_dst);
     } break;
     case pointer_residency::host_only: {
       stream.sync();

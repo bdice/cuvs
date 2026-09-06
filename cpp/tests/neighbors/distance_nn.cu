@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -82,8 +82,10 @@ class NNTest : public ::testing::TestWithParam<NNInputs<IdxT>> {
 
     // CosineExpanded expects ||x|| not ||x||^2
     if (metric == DistanceType::CosineExpanded) {
-      raft::linalg::unaryOp(x_norm.data_handle(), x_norm.data_handle(), m, raft::sqrt_op{}, stream.get());
-      raft::linalg::unaryOp(y_norm.data_handle(), y_norm.data_handle(), n, raft::sqrt_op{}, stream.get());
+      raft::linalg::unaryOp(
+        x_norm.data_handle(), x_norm.data_handle(), m, raft::sqrt_op{}, stream.get());
+      raft::linalg::unaryOp(
+        y_norm.data_handle(), y_norm.data_handle(), n, raft::sqrt_op{}, stream.get());
     }
 
     if constexpr (impl == ImplType::fused) {

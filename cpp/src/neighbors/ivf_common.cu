@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -87,8 +87,14 @@ void sort_cluster_sizes_descending(uint32_t* input,
   cub::DeviceRadixSort::SortKeysDescending(
     nullptr, cub_workspace_size, input, output, n_lists, begin_bit, end_bit, stream.get());
   rmm::device_buffer cub_workspace(cub_workspace_size, stream, tmp_res);
-  cub::DeviceRadixSort::SortKeysDescending(
-    cub_workspace.data(), cub_workspace_size, input, output, n_lists, begin_bit, end_bit, stream.get());
+  cub::DeviceRadixSort::SortKeysDescending(cub_workspace.data(),
+                                           cub_workspace_size,
+                                           input,
+                                           output,
+                                           n_lists,
+                                           begin_bit,
+                                           end_bit,
+                                           stream.get());
 }
 
 }  // namespace cuvs::neighbors::ivf::detail

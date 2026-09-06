@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -1076,11 +1076,11 @@ class batch_runner {
         auto bs = dim3(128, 8, 1);
         scatter_outputs<T, IdxT>
           <<<1, bs, 0, stream.get()>>>(request_ptrs,
-                                 batch_neighbors,
-                                 batch_distances,
-                                 kernel_progress_counters_.data_handle() + batch_id,
-                                 &next_token_ref,
-                                 batch_queue::make_seq_batch_id(next_seq_id, batch_id));
+                                       batch_neighbors,
+                                       batch_distances,
+                                       kernel_progress_counters_.data_handle() + batch_id,
+                                       &next_token_ref,
+                                       batch_queue::make_seq_batch_id(next_seq_id, batch_id));
         RAFT_CUDA_TRY(cudaEventRecord(completion_events_[batch_id].value(), stream.get()));
         dispatch_sequence_id_ref.store(seq_id.value, cuda::std::memory_order_release);
         dispatch_sequence_id_ref.notify_all();

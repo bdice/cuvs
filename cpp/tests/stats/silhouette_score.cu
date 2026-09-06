@@ -65,7 +65,8 @@ class silhouetteScoreTest : public ::testing::TestWithParam<silhouetteScoreParam
     d_X.resize(nElements, stream);
     d_labels.resize(nElements, stream);
     RAFT_CUDA_TRY(cudaMemsetAsync(d_X.data(), 0, d_X.size() * sizeof(DataT), stream.get()));
-    RAFT_CUDA_TRY(cudaMemsetAsync(d_labels.data(), 0, d_labels.size() * sizeof(LabelT), stream.get()));
+    RAFT_CUDA_TRY(
+      cudaMemsetAsync(d_labels.data(), 0, d_labels.size() * sizeof(LabelT), stream.get()));
     sampleSilScore.resize(nElements, stream);
 
     raft::update_device(d_X.data(), &h_X[0], (int)nElements, stream);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -216,17 +216,17 @@ auto reference(const raft::handle_t& handle, const Inputs<DataT>& inp, const Par
   dim3 nblks(1, 200, 1);
   referenceKernel<DataT, decltype(op), nwarps>
     <<<nblks, TPB, 0, stream.get()>>>(out.data_handle(),
-                                inp.x.data_handle(),
-                                inp.y.data_handle(),
-                                inp.adj.data_handle(),
-                                inp.group_idxs.data_handle(),
-                                m,
-                                n,
-                                k,
-                                num_groups,
-                                p.sqrt,
-                                (int*)workspace.data(),
-                                std::numeric_limits<DataT>::max());
+                                      inp.x.data_handle(),
+                                      inp.y.data_handle(),
+                                      inp.adj.data_handle(),
+                                      inp.group_idxs.data_handle(),
+                                      m,
+                                      n,
+                                      k,
+                                      num_groups,
+                                      p.sqrt,
+                                      (int*)workspace.data(),
+                                      std::numeric_limits<DataT>::max());
   RAFT_CUDA_TRY(cudaGetLastError());
 
   return out;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -357,22 +357,22 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
       size_t shared_mem    = D * sizeof(float) + block_size * sizeof(float);
       exrabitq_quantize_query<block_size>
         <<<grid_size, block_size, shared_mem, stream_.get()>>>(queries.data_handle(),
-                                                         num_queries,
-                                                         D,
-                                                         num_bits,
-                                                         best_rescaling_factor,
-                                                         1.9f,
-                                                         d_quantized_queries.data_handle(),
-                                                         d_widths.data_handle());
+                                                               num_queries,
+                                                               D,
+                                                               num_bits,
+                                                               best_rescaling_factor,
+                                                               1.9f,
+                                                               d_quantized_queries.data_handle(),
+                                                               d_widths.data_handle());
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     } else {  // scalar quantize
       // Step 1: Find min/max for each query
       const int block_size = 256;
       const int grid_size  = num_queries;
       findQueryRanges<<<grid_size, block_size, 0, stream_.get()>>>(queries.data_handle(),
-                                                             d_query_ranges.data_handle(),
-                                                             num_queries,
-                                                             cur_ivf.get_num_padded_dim());
+                                                                   d_query_ranges.data_handle(),
+                                                                   num_queries,
+                                                                   cur_ivf.get_num_padded_dim());
       RAFT_CUDA_TRY(cudaPeekAtLastError());
 
       // Step 2: Quantize queries to int8_t with BQ=8
