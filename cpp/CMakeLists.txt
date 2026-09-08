@@ -9,6 +9,7 @@ include(rapids-cmake)
 include(rapids-cpm)
 include(rapids-export)
 include(rapids-find)
+include(${rapids-cmake-dir}/cython-core/find_prefix_paths.cmake)
 
 option(BUILD_CPU_ONLY "Build CPU only components. Applies to CUVS benchmarks currently" OFF)
 
@@ -27,6 +28,15 @@ project(
   VERSION "${RAPIDS_VERSION}"
   LANGUAGES ${lang_list}
 )
+
+# Find CMake packages provided by installed wheels.
+find_package(Python COMPONENTS Interpreter)
+if(Python_FOUND)
+  rapids_cython_find_prefix_paths("${Python_EXECUTABLE}" wheel_prefix_paths)
+  set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS TRUE)
+  list(PREPEND CMAKE_PREFIX_PATH ${wheel_prefix_paths})
+endif()
+
 set(CMAKE_INSTALL_MESSAGE LAZY)
 
 # Disable C++20 module scanning (not using modules, just C++20 features)
