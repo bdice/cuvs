@@ -304,7 +304,6 @@ void transpose_pq_centers(const raft::resources& handle,
                           owning_impl<IdxT>* impl,
                           const float* pq_centers_source)
 {
-  auto stream  = raft::resource::get_cuda_stream(handle);
   auto extents = impl->pq_centers().extents();
   static_assert(extents.rank() == 3);
   auto extents_source =
@@ -962,8 +961,6 @@ void erase_list(raft::resources const& res, index<IdxT>* index, uint32_t label)
 template <typename IdxT>
 auto clone(const raft::resources& res, const index<IdxT>& source) -> index<IdxT>
 {
-  auto stream = raft::resource::get_cuda_stream(res);
-
   // Create owning_impl directly to get mutable access for copying
   auto impl = std::make_unique<owning_impl<IdxT>>(res,
                                                   source.metric(),
