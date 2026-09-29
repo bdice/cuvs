@@ -6,6 +6,7 @@
 #include "ivf_common.cuh"
 
 #include <cuda/stream>
+#include <cuvs/core/resource_ref.hpp>
 #include <raft/util/cudart_utils.hpp>
 #include <raft/util/pow2_utils.cuh>
 
@@ -80,7 +81,7 @@ void sort_cluster_sizes_descending(uint32_t* input,
                                    uint32_t* output,
                                    uint32_t n_lists,
                                    cuda::stream_ref stream,
-                                   rmm::device_async_resource_ref tmp_res)
+                                   cuvs::device_resource_ref tmp_res)
 {
   int begin_bit             = 0;
   int end_bit               = sizeof(uint32_t) * 8;
