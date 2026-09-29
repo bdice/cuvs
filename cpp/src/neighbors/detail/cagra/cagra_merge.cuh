@@ -26,7 +26,7 @@
 #include <cuvs/neighbors/ivf_pq.hpp>
 #include <cuvs/neighbors/refine.hpp>
 
-#include <rmm/resource_ref.hpp>
+#include <cuvs/core/resource_ref.hpp>
 
 #include <limits>
 #include <memory>
