@@ -1659,7 +1659,13 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
 inline std::vector<AnnCagraInputs> generate_inputs()
 {
   // TODO(tfeher): test MULTI_CTA kernel with search_width > 1 to allow multiple CTA per queries
-  // Change graph dim, search algo and max_query parameter
+  // The graph build time dominates the test time, so the graph build algo and the search algo are
+  // swept separately instead of as a full tensor product.
+  // L1 is only supported with ITERATIVE_CAGRA_SEARCH, BitwiseHamming is always skipped for 1000
+  // rows with dim <= 16 and k = 16, and Cosine is skipped for dim == 1, so these are not included
+  // where they would only be skipped.
+
+  // Change graph dim, degree and graph build algo with a single search algo
   std::vector<AnnCagraInputs> inputs = raft::util::itertools::product<AnnCagraInputs>(
     {100},
     {1000},
@@ -1667,16 +1673,12 @@ inline std::vector<AnnCagraInputs> generate_inputs()
     {16},                                                      // k
     {47, 64},                                                  // degree
     {graph_build_algo::IVF_PQ, graph_build_algo::NN_DESCENT},  // build algo.
-    {search_algo::SINGLE_CTA, search_algo::MULTI_CTA, search_algo::MULTI_KERNEL},
+    {search_algo::SINGLE_CTA},
     {0, 10},  // query size
     {0},
     {256},
     {1},
-    {cuvs::distance::DistanceType::L2Expanded,
-     cuvs::distance::DistanceType::InnerProduct,
-     cuvs::distance::DistanceType::BitwiseHamming,
-     cuvs::distance::DistanceType::CosineExpanded,
-     cuvs::distance::DistanceType::L1},
+    {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::InnerProduct},
     {false},
     {true},
     {true},
@@ -1684,7 +1686,73 @@ inline std::vector<AnnCagraInputs> generate_inputs()
     {std::optional<float>{std::nullopt}},
     {cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL});
 
+  // Cosine is skipped for dim == 1
   auto inputs2 = raft::util::itertools::product<AnnCagraInputs>(
+    {100},
+    {1000},
+    {16},
+    {16},                                                      // k
+    {47, 64},                                                  // degree
+    {graph_build_algo::IVF_PQ, graph_build_algo::NN_DESCENT},  // build algo.
+    {search_algo::SINGLE_CTA},
+    {0, 10},  // query size
+    {0},
+    {256},
+    {1},
+    {cuvs::distance::DistanceType::CosineExpanded},
+    {false},
+    {true},
+    {true},
+    {0.995},
+    {std::optional<float>{std::nullopt}},
+    {cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL});
+  inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
+
+  // Change search algo and max_query parameter with a single (cheap) graph build algo
+  inputs2 = raft::util::itertools::product<AnnCagraInputs>(
+    {100},
+    {1000},
+    {1, 16},
+    {16},  // k
+    {64},  // degree
+    {graph_build_algo::IVF_PQ},
+    {search_algo::MULTI_CTA, search_algo::MULTI_KERNEL},
+    {0, 10},  // query size
+    {0},
+    {256},
+    {1},
+    {cuvs::distance::DistanceType::L2Expanded, cuvs::distance::DistanceType::InnerProduct},
+    {false},
+    {true},
+    {true},
+    {0.995},
+    {std::optional<float>{std::nullopt}},
+    {cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL});
+  inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
+
+  // Cosine is skipped for dim == 1
+  inputs2 = raft::util::itertools::product<AnnCagraInputs>(
+    {100},
+    {1000},
+    {16},
+    {16},  // k
+    {64},  // degree
+    {graph_build_algo::IVF_PQ},
+    {search_algo::MULTI_CTA, search_algo::MULTI_KERNEL},
+    {0, 10},  // query size
+    {0},
+    {256},
+    {1},
+    {cuvs::distance::DistanceType::CosineExpanded},
+    {false},
+    {true},
+    {true},
+    {0.995},
+    {std::optional<float>{std::nullopt}},
+    {cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL});
+  inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
+
+  inputs2 = raft::util::itertools::product<AnnCagraInputs>(
     {100},
     {1000},
     {1, 16},
