@@ -19,6 +19,7 @@
 #include <raft/util/cudart_utils.hpp>
 #include <raft/util/integer_utils.hpp>
 #include <rmm/cuda_stream_pool.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda.h>
 #include <cuda_fp16.h>
