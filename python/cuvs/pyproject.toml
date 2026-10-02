@@ -44,7 +44,7 @@ test = [
 
 [project.urls]
 Homepage = "https://github.com/nvidia/cuvs"
-Documentation = "https://docs.rapids.ai/api/cuvs/stable/"
+Documentation = "https://docs.nvidia.com/cuvs"
 
 [tool.isort]
 line_length = 79

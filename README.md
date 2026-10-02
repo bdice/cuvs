@@ -82,7 +82,7 @@ cuVS comes with pre-built packages that can be installed through [conda](https:/
 > [!NOTE]
 > If compiled binary size is a concern, please note that the cuVS builds for CUDA 13 are roughly half the size of CUDA 12 builds. This is a result of improved compression rates in the newer supported CUDA drivers. We will be adopting the newer drivers for CUDA 12 builds in Spring of 2026, which will ultimately bring them down to roughly the size of the CUDA 13 builds. In the meantime, the NVIDIA cuVS team is continuing to shave down the binary sizes for all supported CUDA versions. If binary size is an issue for you, please consider linking to cuVS statically either by building from source or using pre-built `libcuvs-static` conda package.
 
-Please see the [Build and Install Guide](https://docs.rapids.ai/api/cuvs/nightly/build/) for more information on installing the available cuVS packages and building from source.
+Please see the [Build and Install Guide](https://docs.nvidia.com/cuvs/installation) for more information on installing the available cuVS packages and building from source.
 
 ### Standalone C library (Docker)
 
