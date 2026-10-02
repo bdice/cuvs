@@ -96,7 +96,7 @@ auto vector_view = raft::make_host_vector_view(vector.data_handle(), vector.exte
 auto matrix_view = raft::make_host_matrix_view(matrix.data_handle(), matrix.extent(0), matrix.extent(1));
 ```
 
-Please refer to RAFT's [mdspan documentation](https://docs.rapids.ai/api/raft/stable/cpp_api/mdspan/) to learn more.
+Please refer to RAFT's [mdspan documentation](https://docs.nvidia.com/raft/latest/cpp_api/mdspan/) to learn more.
 
 ## CUDA array interface (Python)
 

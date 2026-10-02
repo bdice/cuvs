@@ -1,4 +1,4 @@
-# <div align="left"><img src="https://rapids.ai/assets/images/rapids_logo.png" width="90px"/>&nbsp;cuVS: Vector Search and Clustering on the GPU</div>
+# cuVS: Vector Search and Clustering on the GPU
 
 
 ## Contents
@@ -17,7 +17,6 @@
 - [Getting Started Guide](https://docs.nvidia.com/cuvs/getting-started): Guide to getting started with cuVS.
 - [Code Examples](https://github.com/nvidia/cuvs/tree/HEAD/examples): Self-contained Code Examples.
 - [API Reference Documentation](https://docs.nvidia.com/cuvs/api_reference): API Documentation.
-- [RAPIDS Community](https://rapids.ai/community.html): Get help, contribute, and collaborate.
 - [GitHub repository](https://github.com/nvidia/cuvs): Download the cuVS source code.
 - [Issue tracker](https://github.com/nvidia/cuvs/issues): Report issues or request features.
 
@@ -69,7 +68,7 @@ In addition to the items above, cuVS shoulders the burden of keeping non-trivial
 
 ## cuVS Technology Stack
 
-cuVS is built on top of the RAPIDS RAFT library of high performance machine learning primitives and provides all the necessary routines for vector search and clustering on the GPU.
+cuVS is built on top of the NVIDIA RAFT library of high performance machine learning primitives and provides all the necessary routines for vector search and clustering on the GPU.
 
 ![cuVS is built on top of low-level CUDA libraries and provides many important routines that enable vector search and clustering on the GPU](img/tech_stack.png "cuVS Technology Stack")
 
