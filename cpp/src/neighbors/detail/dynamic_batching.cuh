@@ -923,6 +923,14 @@ class batch_runner {
       request_ptrs_{raft::make_pinned_matrix<request_pointers<T, IdxT>, uint32_t>(
         res_, n_queues_, max_batch_size_)}
   {
+    // Unless `conservative_dispatch` is set, the upstream search always runs on all
+    // `max_batch_size` rows of a batch, including the rows no request has filled. Make sure these
+    // rows hold valid (zero) values rather than whatever the allocation contained, which may be
+    // NaNs.
+    RAFT_CUDA_TRY(cudaMemsetAsync(queries_.data_handle(),
+                                  0,
+                                  sizeof(T) * queries_.size(),
+                                  raft::resource::get_cuda_stream(res_).get()));
     RAFT_CUDA_TRY(cudaMemsetAsync(
       kernel_progress_counters_.data_handle(),
       0,
