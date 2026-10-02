@@ -5,7 +5,7 @@
 #pragma once
 
 // TODO: This shouldn't be invoking anything from detail outside of neighbors namespace
-#include <cuvs/core/resource_ref.hpp>
+#include <cuda/memory_resource>
 #include <raft/core/copy.cuh>
 #include <raft/core/detail/macros.hpp>
 #include <raft/core/device_mdarray.hpp>
@@ -277,7 +277,7 @@ void copy_with_padding(
   raft::resources const& res,
   raft::device_matrix<T, int64_t, raft::row_major>& dst,
   raft::mdspan<const T, raft::matrix_extent<int64_t>, raft::row_major, data_accessor> src,
-  cuvs::device_resource_ref mr = rmm::mr::get_current_device_resource_ref())
+  cuda::mr::device_resource_ref mr = rmm::mr::get_current_device_resource_ref())
 {
   size_t padded_dim = raft::round_up_safe<size_t>(src.extent(1) * sizeof(T), 16) / sizeof(T);
 

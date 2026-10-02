@@ -5,8 +5,8 @@
 
 #pragma once
 
+#include <cuda/memory_resource>
 #include <cuda/stream>
-#include <cuvs/core/resource_ref.hpp>
 #include <cuvs/distance/distance.hpp>
 #include <raft/core/copy.cuh>
 #include <raft/core/device_mdspan.hpp>
@@ -22,7 +22,7 @@ void sort_cluster_sizes_descending(uint32_t* input,
                                    uint32_t* output,
                                    uint32_t n_lists,
                                    cuda::stream_ref stream,
-                                   cuvs::device_resource_ref tmp_res);
+                                   cuda::mr::device_resource_ref tmp_res);
 
 /**
  * Default value returned by `search` when the `n_probes` is too small and top-k is too large.

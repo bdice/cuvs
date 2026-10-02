@@ -8,7 +8,6 @@
 #include <raft/core/error.hpp>
 #include <raft/core/logger_macros.hpp>
 
-#include <cuvs/core/resource_ref.hpp>
 #include <rmm/detail/aligned.hpp>
 
 #include <cuda/memory_resource>

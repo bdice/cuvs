@@ -40,7 +40,7 @@
 // TODO: This shouldn't be calling spatial/knn APIs
 #include "../ann_utils.cuh"
 
-#include <cuvs/core/resource_ref.hpp>
+#include <cuda/memory_resource>
 
 #include <algorithm>
 #include <array>
@@ -2005,9 +2005,9 @@ void build_knn_graph(
   }
 
   // If the workspace is smaller than desired, put the I/O buffers into the large workspace.
-  cuvs::device_resource_ref workspace_mr = use_large_workspace
-                                             ? raft::resource::get_large_workspace_resource_ref(res)
-                                             : raft::resource::get_workspace_resource_ref(res);
+  cuda::mr::device_resource_ref workspace_mr =
+    use_large_workspace ? raft::resource::get_large_workspace_resource_ref(res)
+                        : raft::resource::get_workspace_resource_ref(res);
 
   RAFT_LOG_DEBUG(
     "IVF-PQ search node_degree: %d, top_k: %d,  gpu_top_k: %d,  max_batch_size:: %d, n_probes: %u",

@@ -32,7 +32,7 @@
 #include <raft/util/cuda_rt_essentials.hpp>
 #include <raft/util/integer_utils.hpp>
 
-#include <cuvs/core/resource_ref.hpp>
+#include <cuda/memory_resource>
 
 #include <thrust/fill.h>
 
@@ -352,7 +352,7 @@ void search_impl(raft::resources const& handle,
                  uint32_t n_probes,
                  int64_t* neighbors,
                  float* distances,
-                 cuvs::device_resource_ref search_mr,
+                 cuda::mr::device_resource_ref search_mr,
                  IvfSampleFilterT sample_filter)
 {
   auto stream = raft::resource::get_cuda_stream(handle);
