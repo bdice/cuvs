@@ -38,7 +38,7 @@ Please refer to [NVIDIA cuVS C API documentation](/api-reference/c-api-documenta
 
 ## Multi-dimensional span (C++)
 
-NVIDIA cuVS is built on top of the GPU-accelerated machine learning and data mining primitives in the [RAFT](https://github.com/rapidsai/raft) library. Most of the C++ APIs in NVIDIA cuVS accept [mdspan](https://arxiv.org/abs/2010.06474) multi-dimensional array view for representing data in higher dimensions similar to the `ndarray` in the Numpy Python library. RAFT also contains the corresponding owning `mdarray` structure, which simplifies the allocation and management of multi-dimensional data in both host and device (GPU) memory.
+NVIDIA cuVS is built on top of the GPU-accelerated machine learning and data mining primitives in the [RAFT](https://github.com/NVIDIA/raft) library. Most of the C++ APIs in NVIDIA cuVS accept [mdspan](https://arxiv.org/abs/2010.06474) multi-dimensional array view for representing data in higher dimensions similar to the `ndarray` in the Numpy Python library. RAFT also contains the corresponding owning `mdarray` structure, which simplifies the allocation and management of multi-dimensional data in both host and device (GPU) memory.
 
 The `mdarray` is an owning object that forms a convenience layer over RMM and can be constructed in RAFT using a number of different helper functions:
 

@@ -60,6 +60,6 @@ In addition to the items above, NVIDIA cuVS shoulders the responsibility of keep
 
 ## NVIDIA cuVS Technology Stack
 
-NVIDIA cuVS is built on top of the [RAPIDS RAFT](https://github.com/rapidsai/raft) library of high performance machine learning primitives and provides all the necessary routines for vector search and clustering on the GPU.
+NVIDIA cuVS is built on top of the [RAPIDS RAFT](https://github.com/NVIDIA/raft) library of high performance machine learning primitives and provides all the necessary routines for vector search and clustering on the GPU.
 
 <img alt="NVIDIA cuVS is built on top of low-level CUDA libraries and provides many important routines that enable vector search and clustering on the GPU" src="/assets/images/tech_stack.png" />
