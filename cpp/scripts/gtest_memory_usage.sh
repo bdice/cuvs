@@ -4,7 +4,7 @@
 
 # Report the peak RMM device memory usage of each libcuvs gtest as CSV.
 # Run from the build directory (the one containing gtests/). Set GTEST_CUVS_RMM_MODE
-# (cuda or async, default cuda) to run the tests on a different RMM memory resource.
+# (async or cuda, default async) to run the tests on a different RMM memory resource.
 
 export GTEST_CUVS_MEMORY_PEAK=1
 export GTEST_BRIEF=1

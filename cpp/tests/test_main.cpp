@@ -21,11 +21,11 @@
 namespace {
 
 /// Returns the mode given by `--rmm_mode=<mode>` (or `--rmm_mode <mode>`), else by
-/// `GTEST_CUVS_RMM_MODE`, else "cuda".
+/// `GTEST_CUVS_RMM_MODE`, else "async".
 std::string get_rmm_mode(int argc, char** argv)
 {
   char const* env_rmm_mode = std::getenv("GTEST_CUVS_RMM_MODE");  // Overridden by CLI options
-  std::string rmm_mode{env_rmm_mode ? env_rmm_mode : "cuda"};
+  std::string rmm_mode{env_rmm_mode ? env_rmm_mode : "async"};
   // InitGoogleTest only removes gtest's own flags from argv, so `--rmm_mode` is still there.
   constexpr std::string_view flag{"--rmm_mode="};
   for (int i = 1; i < argc; ++i) {
@@ -57,9 +57,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible> make_memory_resource(
  *
  * - The RMM device memory resource is chosen by the command line option `--rmm_mode=<mode>` or
  *   the environment variable `GTEST_CUVS_RMM_MODE` (the option takes precedence), like cuDF's
- *   `--rmm_mode` / `GTEST_CUDF_RMM_MODE`. Supported modes are `cuda`
- *   (`rmm::mr::cuda_memory_resource`, the default) and `async`
- *   (`rmm::mr::cuda_async_memory_resource`).
+ *   `--rmm_mode` / `GTEST_CUDF_RMM_MODE`. Supported modes are `async`
+ *   (`rmm::mr::cuda_async_memory_resource`, the default) and `cuda`
+ *   (`rmm::mr::cuda_memory_resource`).
  * - If the environment variable `GTEST_CUVS_MEMORY_PEAK` is set, the chosen resource is wrapped in
  *   an `rmm::mr::statistics_resource_adaptor` and the peak number of bytes allocated through RMM is
  *   printed after the tests complete. This is used by cpp/scripts/gtest_memory_usage.sh to size
