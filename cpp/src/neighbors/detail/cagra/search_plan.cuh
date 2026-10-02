@@ -7,8 +7,8 @@
 
 #include "hashmap.hpp"
 
+#include <cuda/memory_resource>
 #include <cuda/stream>
-#include <cuvs/core/resource_ref.hpp>
 #include <cuvs/neighbors/common.hpp>
 #include <neighbors/detail/cagra/compute_distance-ext.cuh>
 #include <raft/core/resource/cuda_stream.hpp>
@@ -41,7 +41,7 @@ template <typename T>
 struct lightweight_uvector {
  private:
   using raft_res_type            = const raft::resources*;
-  using rmm_res_type             = std::tuple<cuvs::device_resource_ref, cuda::stream_ref>;
+  using rmm_res_type             = std::tuple<cuda::mr::device_resource_ref, cuda::stream_ref>;
   static constexpr size_t kAlign = 256;
 
   std::variant<raft_res_type, rmm_res_type> res_;

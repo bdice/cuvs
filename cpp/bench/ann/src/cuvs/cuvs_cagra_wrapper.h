@@ -26,7 +26,7 @@
 #include <raft/linalg/unary_op.cuh>
 #include <raft/util/cudart_utils.hpp>
 
-#include <cuvs/core/resource_ref.hpp>
+#include <cuda/memory_resource>
 #include <rmm/device_uvector.hpp>
 
 #include <atomic>
@@ -271,7 +271,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   std::shared_ptr<cuvs::neighbors::device_vpq_dataset<half, int64_t>> vpq_dataset_;
   std::shared_ptr<cuvs::neighbors::cagra::device_pq_index<T, IdxT, half>> vpq_index_;
 
-  inline cuvs::device_resource_ref get_mr(AllocatorType mem_type)
+  inline cuda::mr::device_resource_ref get_mr(AllocatorType mem_type)
   {
     switch (mem_type) {
       case (AllocatorType::kHostPinned): return mr_pinned_;

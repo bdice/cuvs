@@ -8,7 +8,7 @@
 #include "cuvs_ann_bench_param_parser.h"
 #include "cuvs_cagra_hnswlib_wrapper.h"
 
-#include <cuvs/core/resource_ref.hpp>
+#include <cuda/memory_resource>
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
