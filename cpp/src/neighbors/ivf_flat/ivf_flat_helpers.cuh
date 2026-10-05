@@ -11,46 +11,49 @@
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/util/pow2_utils.cuh>
+
+#include <algorithm>
+#include <cstddef>
+#include <utility>
 #include <variant>
 
 namespace cuvs::neighbors::ivf_flat::helpers::codepacker {
 
 namespace {
-template <typename T>
-__device__ void pack_1(const T* flat_code, T* block, uint32_t dim, uint32_t veclen, uint32_t offset)
+
+/** Maximum number of threads per block of the pack/unpack kernels. */
+constexpr uint32_t kPackBlockSize = 256;
+/** Maximum `gridDim.y` of the pack/unpack kernels; more row groups use a grid-stride loop. */
+constexpr uint32_t kPackMaxGridY = 65535;
+
+/** In-list position of the row `row` of the flat codes: `offset + row` or `indices[row]`. */
+__device__ __forceinline__ auto list_position(
+  const std::variant<uint32_t, const uint32_t*>& offset_or_indices, uint32_t row) -> uint32_t
 {
-  // The data is written in interleaved groups of `index::kGroupSize` vectors
-  using interleaved_group = raft::Pow2<kIndexGroupSize>;
-
-  // Interleave dimensions of the source vector while recording it.
-  // NB: such `veclen` is selected, that `dim % veclen == 0`
-  auto group_offset = interleaved_group::roundDown(offset);
-  auto ingroup_id   = interleaved_group::mod(offset) * veclen;
-
-  for (uint32_t l = 0; l < dim; l += veclen) {
-    for (uint32_t j = 0; j < veclen; j++) {
-      block[group_offset * dim + l * kIndexGroupSize + ingroup_id + j] = flat_code[l + j];
-    }
-  }
+  return std::holds_alternative<uint32_t>(offset_or_indices)
+           ? std::get<uint32_t>(offset_or_indices) + row
+           : std::get<const uint32_t*>(offset_or_indices)[row];
 }
 
-template <typename T>
-__device__ void unpack_1(
-  const T* block, T* flat_code, uint32_t dim, uint32_t veclen, uint32_t offset)
+/**
+ * Offset in the interleaved list data of the component `l + j` of the record at the in-list
+ * position `pos`, where `l % veclen == 0` and `j < veclen` (see `index::data()` for the layout).
+ */
+__device__ __forceinline__ auto interleaved_offset(
+  uint32_t pos, uint32_t dim, uint32_t veclen, uint32_t l, uint32_t j) -> size_t
 {
-  // The data is written in interleaved groups of `index::kGroupSize` vectors
   using interleaved_group = raft::Pow2<kIndexGroupSize>;
-
-  // NB: such `veclen` is selected, that `dim % veclen == 0`
-  auto group_offset = interleaved_group::roundDown(offset);
-  auto ingroup_id   = interleaved_group::mod(offset) * veclen;
-
-  for (uint32_t l = 0; l < dim; l += veclen) {
-    for (uint32_t j = 0; j < veclen; j++) {
-      flat_code[l + j] = block[group_offset * dim + l * kIndexGroupSize + ingroup_id + j];
-    }
-  }
+  return size_t(interleaved_group::roundDown(pos)) * dim + l * kIndexGroupSize +
+         interleaved_group::mod(pos) * veclen + j;
 }
+
+/*
+ * The pack/unpack kernels copy one element per thread. The rows of the flat codes are processed in
+ * groups of `kIndexGroupSize` (`blockIdx.y`, grid-stride); `blockIdx.x` and `threadIdx.x` index
+ * the `kIndexGroupSize * dim` elements of a group. The elements are enumerated in the layout of the
+ * destination, so that consecutive threads write consecutive elements, while the reads are runs of
+ * `veclen` consecutive elements.
+ */
 
 template <typename T>
 RAFT_KERNEL pack_interleaved_list_kernel(const T* codes,
@@ -60,11 +63,23 @@ RAFT_KERNEL pack_interleaved_list_kernel(const T* codes,
                                          uint32_t veclen,
                                          std::variant<uint32_t, const uint32_t*> offset_or_indices)
 {
-  uint32_t tid          = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t dst_ix = std::holds_alternative<uint32_t>(offset_or_indices)
-                            ? std::get<uint32_t>(offset_or_indices) + tid
-                            : std::get<const uint32_t*>(offset_or_indices)[tid];
-  if (tid < n_rows) { pack_1(codes + tid * dim, list_data, dim, veclen, dst_ix); }
+  const uint32_t ix = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ix >= kIndexGroupSize * dim) { return; }
+  // Interleaved order within a group: (chunk of `veclen` components, row, component in chunk).
+  const uint32_t chunk_size   = kIndexGroupSize * veclen;
+  const uint32_t chunk_ix     = ix / chunk_size;
+  const uint32_t in_chunk     = ix - chunk_ix * chunk_size;
+  const uint32_t row_in_group = in_chunk / veclen;
+  const uint32_t j            = in_chunk - row_in_group * veclen;
+  const uint32_t l            = chunk_ix * veclen;
+  const uint32_t n_groups     = raft::div_rounding_up_safe<uint32_t>(n_rows, kIndexGroupSize);
+  for (uint32_t group = blockIdx.y; group < n_groups; group += gridDim.y) {
+    const uint32_t row = group * kIndexGroupSize + row_in_group;
+    if (row < n_rows) {
+      const uint32_t dst_ix = list_position(offset_or_indices, row);
+      list_data[interleaved_offset(dst_ix, dim, veclen, l, j)] = codes[size_t(row) * dim + l + j];
+    }
+  }
 }
 
 template <typename T>
@@ -76,11 +91,39 @@ RAFT_KERNEL unpack_interleaved_list_kernel(
   uint32_t veclen,
   std::variant<uint32_t, const uint32_t*> offset_or_indices)
 {
-  uint32_t tid          = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t src_ix = std::holds_alternative<uint32_t>(offset_or_indices)
-                            ? std::get<uint32_t>(offset_or_indices) + tid
-                            : std::get<const uint32_t*>(offset_or_indices)[tid];
-  if (tid < n_rows) { unpack_1(list_data, codes + tid * dim, dim, veclen, src_ix); }
+  const uint32_t ix = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ix >= kIndexGroupSize * dim) { return; }
+  // Row-major order within a group: (row, component).
+  const uint32_t row_in_group = ix / dim;
+  const uint32_t c            = ix - row_in_group * dim;
+  const uint32_t j            = c % veclen;
+  const uint32_t l            = c - j;
+  const uint32_t n_groups     = raft::div_rounding_up_safe<uint32_t>(n_rows, kIndexGroupSize);
+  for (uint32_t group = blockIdx.y; group < n_groups; group += gridDim.y) {
+    const uint32_t row = group * kIndexGroupSize + row_in_group;
+    if (row < n_rows) {
+      const uint32_t src_ix        = list_position(offset_or_indices, row);
+      codes[size_t(row) * dim + c] = list_data[interleaved_offset(src_ix, dim, veclen, l, j)];
+    }
+  }
+}
+
+/** Launch configuration of the pack/unpack kernels: {blocks, threads}. */
+inline auto pack_launch_config(uint32_t n_rows, uint32_t dim, uint32_t veclen)
+  -> std::pair<dim3, dim3>
+{
+  RAFT_EXPECTS(veclen > 0 && dim % veclen == 0,
+               "ivf_flat codepacker: veclen (%u) must be positive and divide dim (%u)",
+               veclen,
+               dim);
+  // `kIndexGroupSize * dim` is a multiple of the warp size.
+  const uint32_t group_elems = kIndexGroupSize * dim;
+  const uint32_t n_groups    = raft::div_rounding_up_safe<uint32_t>(n_rows, kIndexGroupSize);
+  dim3 threads(std::min(kPackBlockSize, group_elems), 1, 1);
+  dim3 blocks(raft::div_rounding_up_safe<uint32_t>(group_elems, threads.x),
+              std::min(n_groups, kPackMaxGridY),
+              1);
+  return {blocks, threads};
 }
 
 template <typename T, typename IdxT>
@@ -95,10 +138,8 @@ void pack_list_data(
   uint32_t n_rows = codes.extent(0);
   uint32_t dim    = codes.extent(1);
   if (n_rows == 0 || dim == 0) return;
-  static constexpr uint32_t kBlockSize = 256;
-  dim3 blocks(raft::div_rounding_up_safe<uint32_t>(n_rows, kBlockSize), 1, 1);
-  dim3 threads(kBlockSize, 1, 1);
-  auto stream = raft::resource::get_cuda_stream(res);
+  auto [blocks, threads] = pack_launch_config(n_rows, dim, veclen);
+  auto stream            = raft::resource::get_cuda_stream(res);
   pack_interleaved_list_kernel<<<blocks, threads, 0, stream.get()>>>(
     codes.data_handle(), list_data.data_handle(), n_rows, dim, veclen, offset_or_indices);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
@@ -116,10 +157,8 @@ void unpack_list_data(
   uint32_t n_rows = codes.extent(0);
   uint32_t dim    = codes.extent(1);
   if (n_rows == 0 || dim == 0) return;
-  static constexpr uint32_t kBlockSize = 256;
-  dim3 blocks(raft::div_rounding_up_safe<uint32_t>(n_rows, kBlockSize), 1, 1);
-  dim3 threads(kBlockSize, 1, 1);
-  auto stream = raft::resource::get_cuda_stream(res);
+  auto [blocks, threads] = pack_launch_config(n_rows, dim, veclen);
+  auto stream            = raft::resource::get_cuda_stream(res);
   unpack_interleaved_list_kernel<<<blocks, threads, 0, stream.get()>>>(
     list_data.data_handle(), codes.data_handle(), n_rows, dim, veclen, offset_or_indices);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
