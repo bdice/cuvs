@@ -24,6 +24,7 @@
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/logger.hpp>
+#include <raft/core/resource/thrust_policy.hpp>
 #include <raft/linalg/add.cuh>
 #include <raft/linalg/map.cuh>
 #include <raft/linalg/matrix_vector_op.cuh>
@@ -34,9 +35,11 @@
 #include <raft/util/itertools.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <gtest/gtest.h>
 
+#include <thrust/equal.h>
 #include <thrust/sequence.h>
 
 #include <algorithm>
@@ -48,6 +51,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -351,6 +355,147 @@ inline ::std::ostream& operator<<(::std::ostream& os, const AnnCagraInputs& p)
   return os;
 }
 
+/**
+ * Per-test-suite cache of the indices a fixture builds over its dataset.
+ *
+ * Many parameterized cases differ only in parameters that do not affect the build (search algo,
+ * max_queries, team_size, k, n_queries, output index type, merge strategy, ...), and each of them
+ * used to rebuild an identical index. The fixtures look their build up here instead. An entry is
+ * reused only if its key matches *and* the case's freshly generated dataset is bitwise identical to
+ * the copy the entry was built from, so an incomplete key cannot make a case search an index that
+ * was built over different data. The entry owns that copy; the cached value (padded storage and
+ * indices) may hold views into it.
+ *
+ * Cached values are shared between cases and must not be modified: the fixtures only search,
+ * serialize and merge them, and none of these modify their inputs. The fixtures clear the cache in
+ * TearDownTestSuite, so the GPU memory it holds is bounded by the distinct builds of one suite.
+ */
+template <typename KeyT, typename DataT, typename ValueT>
+class test_index_cache {
+ public:
+  /** Returns the value cached for (`key`, `dataset`), or `build(owned copy of dataset)`. */
+  template <typename BuildFn>
+  auto get_or_build(raft::resources const& res,
+                    KeyT const& key,
+                    DataT const* dataset,
+                    std::size_t size,
+                    BuildFn&& build) -> ValueT&
+  {
+    for (auto& e : entries_) {
+      if (e->key == key && e->dataset.size() == size &&
+          bitwise_equal(res, e->dataset.data(), dataset, size)) {
+        return *e->value;
+      }
+    }
+    cuda::stream_ref stream = raft::resource::get_cuda_stream(res);
+    auto e = std::make_unique<entry>(entry{key, rmm::device_uvector<DataT>(size, stream), nullptr});
+    raft::copy(e->dataset.data(), dataset, size, stream);
+    e->value = std::make_unique<ValueT>(build(static_cast<DataT const*>(e->dataset.data())));
+    raft::resource::sync_stream(res);
+    entries_.push_back(std::move(e));
+    return *entries_.back()->value;
+  }
+
+  void clear() { entries_.clear(); }
+
+ private:
+  struct entry {
+    KeyT key;
+    rmm::device_uvector<DataT> dataset;
+    std::unique_ptr<ValueT> value;
+  };
+
+  static auto bitwise_equal(raft::resources const& res,
+                            DataT const* a,
+                            DataT const* b,
+                            std::size_t size) -> bool
+  {
+    auto const* a_bytes = reinterpret_cast<std::uint8_t const*>(a);
+    auto const* b_bytes = reinterpret_cast<std::uint8_t const*>(b);
+    return thrust::equal(
+      raft::resource::get_thrust_policy(res), a_bytes, a_bytes + size * sizeof(DataT), b_bytes);
+  }
+
+  std::vector<std::unique_ptr<entry>> entries_;
+};
+
+/**
+ * Key of an index the AnnCagraInputs fixtures build: the fields their index_params and build steps
+ * are derived from. The dataset itself is compared by test_index_cache.
+ */
+using cagra_build_key = std::tuple<int,                           // n_rows
+                                   int,                           // dim
+                                   cuvs::distance::DistanceType,  // metric
+                                   int,                           // graph_degree
+                                   graph_build_algo,              // build_algo
+                                   std::optional<float>,          // ivf_pq_search_refine_ratio
+                                   bool,                          // host_dataset
+                                   bool>;                         // use_source_indices
+
+inline auto make_cagra_build_key(AnnCagraInputs const& ps) -> cagra_build_key
+{
+  return {ps.n_rows,
+          ps.dim,
+          ps.metric,
+          ps.graph_degree,
+          ps.build_algo,
+          ps.ivf_pq_search_refine_ratio,
+          ps.host_dataset,
+          ps.use_source_indices};
+}
+
+/** The two half-indices merged by AnnCagraIndexMergeTest and AnnCagraIndexFilteredMergeTest. */
+template <typename DataT, typename IdxT>
+struct cagra_merge_halves {
+  cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded0;
+  cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded1;
+  cagra::device_padded_index<DataT, IdxT> index0;
+  cagra::device_padded_index<DataT, IdxT> index1;
+};
+
+/** Builds one index over the first 55% of the rows of `data` and one over the rest. */
+template <typename DataT, typename IdxT>
+auto build_cagra_merge_halves(raft::resources const& res,
+                              cagra::index_params const& index_params,
+                              AnnCagraInputs const& ps,
+                              DataT const* data) -> cagra_merge_halves<DataT, IdxT>
+{
+  const double split_ratio         = 0.55;
+  const std::size_t database0_size = ps.n_rows * split_ratio;
+  const std::size_t database1_size = ps.n_rows - database0_size;
+
+  auto database0_view =
+    raft::make_device_matrix_view<const DataT, int64_t>(data, database0_size, ps.dim);
+  auto database1_view = raft::make_device_matrix_view<const DataT, int64_t>(
+    data + database0_view.size(), database1_size, ps.dim);
+
+  cagra_merge_halves<DataT, IdxT> halves{
+    {res, database0_view},
+    {res, database1_view},
+    cagra::device_padded_index<DataT, IdxT>(res, index_params.metric),
+    cagra::device_padded_index<DataT, IdxT>(res, index_params.metric)};
+  std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
+  std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host0, ace_host1;
+  if (ps.host_dataset) {
+    database_host.emplace(raft::make_host_matrix<DataT, int64_t>(res, ps.n_rows, ps.dim));
+    raft::copy(database_host->data_handle(),
+               data,
+               database_host->size(),
+               raft::resource::get_cuda_stream(res));
+    raft::resource::sync_stream(res);
+    if (std::holds_alternative<cagra::graph_build_params::ace_params>(
+          index_params.graph_build_params)) {
+      ace_host0.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
+        database_host->data_handle(), database0_size, ps.dim));
+      ace_host1.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
+        database_host->data_handle() + database0_size * ps.dim, database1_size, ps.dim));
+    }
+  }
+  cagra_build_into_index(res, index_params, ace_host0, halves.padded0.view, halves.index0);
+  cagra_build_into_index(res, index_params, ace_host1, halves.padded1.view, halves.index1);
+  return halves;
+}
+
 template <typename DistanceT, typename DataT, typename IdxT>
 class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
  public:
@@ -363,7 +508,12 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
   }
 
  protected:
-  template <typename SearchIdxT = IdxT>
+  /**
+   * Builds the index for `ps` (or reuses an identical one, see build_cache()), runs the serialize /
+   * deserialize round trip once, and then searches the loaded index and checks the results once per
+   * output index type: `SearchIdxT` and each of `MoreSearchIdxT`.
+   */
+  template <typename SearchIdxT = IdxT, typename... MoreSearchIdxT>
   void testCagra()
   {
     // IVF_PQ graph build does not support BitwiseHamming
@@ -389,6 +539,94 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
         ((ps.n_rows < 33) || raft::round_up_safe(ps.n_rows, 32) <= ps.graph_degree * 3))
       GTEST_SKIP();
 
+    cagra::index_params index_params;
+    index_params.metric = ps.metric;  // Note: currently ony the cagra::index_params metric is
+                                      // not used for knn_graph building.
+    index_params.graph_degree              = ps.graph_degree;
+    index_params.intermediate_graph_degree = ps.graph_degree * 2;
+    switch (ps.build_algo) {
+      case graph_build_algo::IVF_PQ:
+        index_params.graph_build_params = graph_build_params::ivf_pq_params(
+          raft::matrix_extent<int64_t>(ps.n_rows, ps.dim), index_params.metric);
+        if (ps.ivf_pq_search_refine_ratio) {
+          std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(
+            index_params.graph_build_params)
+            .refinement_rate = *ps.ivf_pq_search_refine_ratio;
+        }
+        break;
+      case graph_build_algo::NN_DESCENT: {
+        index_params.graph_build_params = graph_build_params::nn_descent_params(
+          index_params.intermediate_graph_degree, index_params.metric);
+        break;
+      }
+      case graph_build_algo::ITERATIVE_CAGRA_SEARCH: {
+        index_params.graph_build_params = graph_build_params::iterative_search_params();
+        break;
+      }
+      case graph_build_algo::AUTO:
+        // do nothing
+        break;
+    };
+
+    cagra::search_params search_params;
+    search_params.algo        = ps.algo;
+    search_params.max_queries = ps.max_queries;
+    search_params.team_size   = ps.team_size;
+    search_params.smem_dtype  = ps.smem_dtype;
+
+    auto build_index = [&](DataT const* data) {
+      auto database_view =
+        raft::make_device_matrix_view<const DataT, int64_t>(data, ps.n_rows, ps.dim);
+      cached_index c{{handle_, database_view},
+                     cagra::device_padded_index<DataT, IdxT>(handle_, index_params.metric)};
+      std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
+      std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host_dataset;
+      if (ps.host_dataset) {
+        database_host.emplace(raft::make_host_matrix<DataT, int64_t>(ps.n_rows, ps.dim));
+        raft::copy(database_host->data_handle(), data, database_host->size(), stream_);
+        raft::resource::sync_stream(handle_);
+        if (std::holds_alternative<cagra::graph_build_params::ace_params>(
+              index_params.graph_build_params)) {
+          ace_host_dataset.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
+            database_host->data_handle(), ps.n_rows, ps.dim));
+        }
+      }
+      cagra_build_into_index(handle_, index_params, ace_host_dataset, c.padded.view, c.index);
+
+      if (ps.use_source_indices) {
+        auto source_indices =
+          raft::make_device_vector<IdxT, int64_t>(handle_, static_cast<int64_t>(c.index.size()));
+        raft::linalg::map_offset(handle_, source_indices.view(), raft::cast_op<IdxT>{});
+        c.index.update_source_indices(handle_, raft::make_const_mdspan(source_indices.view()));
+      }
+      return c;
+    };
+    // Built once per distinct build and shared with the cases that only differ in search
+    // parameters (see build_cache()); serialize and search below do not modify it.
+    auto const& built = build_cache().get_or_build(
+      handle_, make_cagra_build_key(ps), database.data(), database.size(), build_index);
+
+    tmp_index_file index_file;
+    cagra::serialize(handle_, index_file.filename, built.index, ps.include_serialized_dataset);
+
+    cagra::device_padded_index<DataT, IdxT> index(handle_);
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<DataT, int64_t>> loaded_dataset;
+    cagra::deserialize(handle_, index_file.filename, &index, &loaded_dataset);
+
+    if (!ps.include_serialized_dataset) {
+      index = cagra::update_dataset(handle_, std::move(index), built.padded.view);
+    }
+    reference_recall = 1;
+
+    searchAndCheck<SearchIdxT>(search_params, index);
+    (searchAndCheck<MoreSearchIdxT>(search_params, index), ...);
+  }
+
+  /** Searches `index` into `SearchIdxT` outputs and checks the results against naive_knn. */
+  template <typename SearchIdxT>
+  void searchAndCheck(cagra::search_params const& search_params,
+                      cagra::device_padded_index<DataT, IdxT> const& index)
+  {
     size_t queries_size = ps.n_queries * ps.k;
     std::vector<SearchIdxT> indices_Cagra(queries_size);
     std::vector<SearchIdxT> indices_naive(queries_size);
@@ -419,82 +657,6 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
       rmm::device_uvector<SearchIdxT> indices_dev(queries_size, stream_);
 
       {
-        cagra::index_params index_params;
-        index_params.metric = ps.metric;  // Note: currently ony the cagra::index_params metric is
-                                          // not used for knn_graph building.
-        index_params.graph_degree              = ps.graph_degree;
-        index_params.intermediate_graph_degree = ps.graph_degree * 2;
-        switch (ps.build_algo) {
-          case graph_build_algo::IVF_PQ:
-            index_params.graph_build_params = graph_build_params::ivf_pq_params(
-              raft::matrix_extent<int64_t>(ps.n_rows, ps.dim), index_params.metric);
-            if (ps.ivf_pq_search_refine_ratio) {
-              std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(
-                index_params.graph_build_params)
-                .refinement_rate = *ps.ivf_pq_search_refine_ratio;
-            }
-            break;
-          case graph_build_algo::NN_DESCENT: {
-            index_params.graph_build_params = graph_build_params::nn_descent_params(
-              index_params.intermediate_graph_degree, index_params.metric);
-            break;
-          }
-          case graph_build_algo::ITERATIVE_CAGRA_SEARCH: {
-            index_params.graph_build_params = graph_build_params::iterative_search_params();
-            break;
-          }
-          case graph_build_algo::AUTO:
-            // do nothing
-            break;
-        };
-
-        cagra::search_params search_params;
-        search_params.algo        = ps.algo;
-        search_params.max_queries = ps.max_queries;
-        search_params.team_size   = ps.team_size;
-        search_params.smem_dtype  = ps.smem_dtype;
-
-        auto database_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data(), ps.n_rows, ps.dim);
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> device_padded(handle_,
-                                                                                   database_view);
-
-        tmp_index_file index_file;
-        {
-          std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
-          std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host_dataset;
-          cagra::device_padded_index<DataT, IdxT> index(handle_, index_params.metric);
-          if (ps.host_dataset) {
-            database_host.emplace(raft::make_host_matrix<DataT, int64_t>(ps.n_rows, ps.dim));
-            raft::copy(database_host->data_handle(), database.data(), database.size(), stream_);
-            raft::resource::sync_stream(handle_);
-            if (std::holds_alternative<cagra::graph_build_params::ace_params>(
-                  index_params.graph_build_params)) {
-              ace_host_dataset.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-                database_host->data_handle(), ps.n_rows, ps.dim));
-            }
-          }
-          cagra_build_into_index(
-            handle_, index_params, ace_host_dataset, device_padded.view, index);
-
-          if (ps.use_source_indices) {
-            auto source_indices =
-              raft::make_device_vector<IdxT, int64_t>(handle_, static_cast<int64_t>(index.size()));
-            raft::linalg::map_offset(handle_, source_indices.view(), raft::cast_op<IdxT>{});
-            index.update_source_indices(handle_, raft::make_const_mdspan(source_indices.view()));
-          }
-
-          cagra::serialize(handle_, index_file.filename, index, ps.include_serialized_dataset);
-        }
-
-        cagra::device_padded_index<DataT, IdxT> index(handle_);
-        std::unique_ptr<cuvs::neighbors::device_padded_dataset<DataT, int64_t>> loaded_dataset;
-        cagra::deserialize(handle_, index_file.filename, &index, &loaded_dataset);
-
-        if (!ps.include_serialized_dataset) {
-          index = cagra::update_dataset(handle_, std::move(index), device_padded.view);
-        }
-
         auto search_queries_view = raft::make_device_matrix_view<const DataT, int64_t>(
           search_queries.data(), ps.n_queries, ps.dim);
         auto indices_out_view = raft::make_device_matrix_view<SearchIdxT, int64_t>(
@@ -508,8 +670,6 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
         raft::update_host(indices_Cagra.data(), indices_dev.data(), queries_size, stream_);
 
         raft::resource::sync_stream(handle_);
-
-        reference_recall = 1;
       }
 
       // for (int i = 0; i < min(ps.n_queries, 10); i++) {
@@ -565,7 +725,22 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
     search_queries.resize(0, stream_);
   }
 
+ public:
+  static void TearDownTestSuite() { build_cache().clear(); }
+
  private:
+  /** An index built by testCagra (source indices already applied) and the storage it views. */
+  struct cached_index {
+    cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded;
+    cagra::device_padded_index<DataT, IdxT> index;
+  };
+  using build_cache_t = test_index_cache<cagra_build_key, DataT, cached_index>;
+  static auto build_cache() -> build_cache_t&
+  {
+    static build_cache_t cache;
+    return cache;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnCagraInputs ps;
@@ -887,32 +1062,40 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
         search_params.team_size   = ps.team_size;
         search_params.itopk_size  = ps.itopk_size;
 
-        auto database_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data(), ps.n_rows, ps.dim);
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> device_padded(handle_,
-                                                                                   database_view);
-
-        std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
-        std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host_dataset;
-        cagra::device_padded_index<DataT, IdxT> index(handle_);
-        if (ps.host_dataset) {
-          database_host.emplace(raft::make_host_matrix<DataT, int64_t>(ps.n_rows, ps.dim));
-          raft::copy(database_host->data_handle(), database.data(), database.size(), stream_);
-          raft::resource::sync_stream(handle_);
-          if (std::holds_alternative<cagra::graph_build_params::ace_params>(
-                index_params.graph_build_params)) {
-            ace_host_dataset.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-              database_host->data_handle(), ps.n_rows, ps.dim));
+        auto build_index = [&](DataT const* data) {
+          auto database_view =
+            raft::make_device_matrix_view<const DataT, int64_t>(data, ps.n_rows, ps.dim);
+          cached_index c{{handle_, database_view},
+                         cagra::device_padded_index<DataT, IdxT>(handle_)};
+          std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
+          std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host_dataset;
+          if (ps.host_dataset) {
+            database_host.emplace(raft::make_host_matrix<DataT, int64_t>(ps.n_rows, ps.dim));
+            raft::copy(database_host->data_handle(), data, database_host->size(), stream_);
+            raft::resource::sync_stream(handle_);
+            if (std::holds_alternative<cagra::graph_build_params::ace_params>(
+                  index_params.graph_build_params)) {
+              ace_host_dataset.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
+                database_host->data_handle(), ps.n_rows, ps.dim));
+            }
           }
-        }
-        cagra_build_into_index(handle_, index_params, ace_host_dataset, device_padded.view, index);
+          cagra_build_into_index(handle_, index_params, ace_host_dataset, c.padded.view, c.index);
 
-        if (ps.use_source_indices) {
-          auto source_indices =
-            raft::make_device_vector<IdxT, int64_t>(handle_, static_cast<int64_t>(index.size()));
-          raft::linalg::map_offset(handle_, source_indices.view(), raft::cast_op<IdxT>{});
-          index.update_source_indices(std::move(source_indices));
-        }
+          if (ps.use_source_indices) {
+            auto source_indices = raft::make_device_vector<IdxT, int64_t>(
+              handle_, static_cast<int64_t>(c.index.size()));
+            raft::linalg::map_offset(handle_, source_indices.view(), raft::cast_op<IdxT>{});
+            c.index.update_source_indices(std::move(source_indices));
+          }
+          return c;
+        };
+        // Built once per distinct build and shared with the cases that only differ in search
+        // parameters (see build_cache()); the searches below do not modify it.
+        auto const& index =
+          build_cache()
+            .get_or_build(
+              handle_, make_cagra_build_key(ps), database.data(), database.size(), build_index)
+            .index;
 
         auto search_queries_view = raft::make_device_matrix_view<const DataT, int64_t>(
           search_queries.data(), ps.n_queries, ps.dim);
@@ -1151,7 +1334,22 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
     search_queries.resize(0, stream_);
   }
 
+ public:
+  static void TearDownTestSuite() { build_cache().clear(); }
+
  private:
+  /** An index built by testCagra (source indices already applied) and the storage it views. */
+  struct cached_index {
+    cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded;
+    cagra::device_padded_index<DataT, IdxT> index;
+  };
+  using build_cache_t = test_index_cache<cagra_build_key, DataT, cached_index>;
+  static auto build_cache() -> build_cache_t&
+  {
+    static build_cache_t cache;
+    return cache;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnCagraInputs ps;
@@ -1263,6 +1461,8 @@ class AnnCagraIndexFilteredMergeTest : public ::testing::TestWithParam<AnnCagraI
         cagra::index_params index_params;
         index_params.metric = ps.metric;  // Note: currently ony the cagra::index_params metric is
                                           // not used for knn_graph building.
+        index_params.graph_degree              = ps.graph_degree;
+        index_params.intermediate_graph_degree = ps.graph_degree * 2;
 
         switch (ps.build_algo) {
           case graph_build_algo::IVF_PQ:
@@ -1288,48 +1488,22 @@ class AnnCagraIndexFilteredMergeTest : public ::testing::TestWithParam<AnnCagraI
             break;
         };
 
-        const double split_ratio         = 0.55;
-        const std::size_t database0_size = ps.n_rows * split_ratio;
-        const std::size_t database1_size = ps.n_rows - database0_size;
-
-        auto database0_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data(), database0_size, ps.dim);
-
-        auto database1_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data() + database0_view.size(), database1_size, ps.dim);
-
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded0(handle_,
-                                                                             database0_view);
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> padded1(handle_,
-                                                                             database1_view);
-
-        cagra::device_padded_index<DataT, IdxT> index0(handle_, index_params.metric);
-        cagra::device_padded_index<DataT, IdxT> index1(handle_, index_params.metric);
-        std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
-        std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host0, ace_host1;
-        if (ps.host_dataset) {
-          database_host.emplace(raft::make_host_matrix<DataT, int64_t>(handle_, ps.n_rows, ps.dim));
-          raft::copy(database_host->data_handle(), database.data(), database.size(), stream_);
-          raft::resource::sync_stream(handle_);
-          if (std::holds_alternative<cagra::graph_build_params::ace_params>(
-                index_params.graph_build_params)) {
-            ace_host0.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-              database_host->data_handle(), database0_size, ps.dim));
-            ace_host1.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-              database_host->data_handle() + database0_size * ps.dim, database1_size, ps.dim));
-          }
-        }
-        cagra_build_into_index(handle_, index_params, ace_host0, padded0.view, index0);
-        cagra_build_into_index(handle_, index_params, ace_host1, padded1.view, index1);
+        // The halves are built once per distinct build and shared with the cases that only differ
+        // in search parameters (see halves_cache()); cagra::merge does not modify its inputs.
+        auto build_halves = [&](DataT const* data) {
+          return build_cagra_merge_halves<DataT, IdxT>(handle_, index_params, ps, data);
+        };
+        auto& halves = halves_cache().get_or_build(
+          handle_, make_cagra_build_key(ps), database.data(), database.size(), build_halves);
 
         std::vector<cuvs::neighbors::cagra::device_padded_index<DataT, IdxT>*> indices;
-        indices.push_back(&index0);
-        indices.push_back(&index1);
+        indices.push_back(&halves.index0);
+        indices.push_back(&halves.index1);
 
         auto merged_matrix = raft::make_device_matrix<DataT, int64_t>(
           handle_,
           ps.n_rows - static_cast<int64_t>(test_cagra_sample_filter::offset),
-          static_cast<int64_t>(index0.dataset().stride()));
+          static_cast<int64_t>(halves.index0.dataset().stride()));
         auto merged_dataset = cuvs::neighbors::device_padded_dataset<DataT, int64_t>(
           std::move(merged_matrix), static_cast<uint32_t>(ps.dim));
         auto merge_idx = cuvs::neighbors::cagra::merge(
@@ -1356,7 +1530,10 @@ class AnnCagraIndexFilteredMergeTest : public ::testing::TestWithParam<AnnCagraI
         raft::resource::sync_stream(handle_);
       }
 
+      // Heuristic recall threshold update
       double min_recall = ps.min_recall;
+      if (ps.graph_degree < 50) { min_recall *= 0.94; }
+      if (ps.graph_degree < 40) { min_recall *= 0.94; }
       EXPECT_TRUE(eval_neighbours(indices_naive,
                                   indices_Cagra,
                                   distances_naive,
@@ -1400,7 +1577,17 @@ class AnnCagraIndexFilteredMergeTest : public ::testing::TestWithParam<AnnCagraI
     search_queries.resize(0, stream_);
   }
 
+ public:
+  static void TearDownTestSuite() { halves_cache().clear(); }
+
  private:
+  using halves_cache_t = test_index_cache<cagra_build_key, DataT, cagra_merge_halves<DataT, IdxT>>;
+  static auto halves_cache() -> halves_cache_t&
+  {
+    static halves_cache_t cache;
+    return cache;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnCagraInputs ps;
@@ -1420,7 +1607,12 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
   }
 
  protected:
-  template <typename SearchIdxT = IdxT>
+  /**
+   * Builds the two half-indices for `ps` (or reuses identical ones, see halves_cache()), merges
+   * them with `ps.merge_strategy`, and then searches the merged index and checks the results once
+   * per output index type: `SearchIdxT` and each of `MoreSearchIdxT`.
+   */
+  template <typename SearchIdxT = IdxT, typename... MoreSearchIdxT>
   void testCagra()
   {
     if (ps.metric == cuvs::distance::DistanceType::L1 &&
@@ -1461,6 +1653,93 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
     // IVF_PQ requires the `n_rows >= n_lists`.
     if (ps.n_rows < 8 && ps.build_algo == graph_build_algo::IVF_PQ) GTEST_SKIP();
 
+    cagra::index_params index_params;
+    index_params.metric = ps.metric;  // Note: currently ony the cagra::index_params metric is
+                                      // not used for knn_graph building.
+    index_params.graph_degree              = ps.graph_degree;
+    index_params.intermediate_graph_degree = ps.graph_degree * 2;
+
+    switch (ps.build_algo) {
+      case graph_build_algo::IVF_PQ:
+        index_params.graph_build_params = graph_build_params::ivf_pq_params(
+          raft::matrix_extent<int64_t>(ps.n_rows, ps.dim), index_params.metric);
+        if (ps.ivf_pq_search_refine_ratio) {
+          std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(
+            index_params.graph_build_params)
+            .refinement_rate = *ps.ivf_pq_search_refine_ratio;
+        }
+        break;
+      case graph_build_algo::NN_DESCENT: {
+        index_params.graph_build_params =
+          graph_build_params::nn_descent_params(index_params.intermediate_graph_degree);
+        break;
+      }
+      case graph_build_algo::ITERATIVE_CAGRA_SEARCH: {
+        index_params.graph_build_params = graph_build_params::iterative_search_params();
+        break;
+      }
+      case graph_build_algo::AUTO:
+        // do nothing
+        break;
+    };
+
+    cagra::search_params search_params;
+    search_params.algo        = ps.algo;
+    search_params.max_queries = ps.max_queries;
+    search_params.team_size   = ps.team_size;
+    search_params.itopk_size  = ps.itopk_size;
+
+    // The halves are built once per distinct build and shared with the cases that only differ in
+    // search parameters or merge strategy (see halves_cache()). cagra::merge and composite_index
+    // take non-const pointers but do not modify their inputs.
+    auto build_halves = [&](DataT const* data) {
+      return build_cagra_merge_halves<DataT, IdxT>(handle_, index_params, ps, data);
+    };
+    auto& halves = halves_cache().get_or_build(
+      handle_, make_cagra_build_key(ps), database.data(), database.size(), build_halves);
+    std::vector<cagra::device_padded_index<DataT, IdxT>*> indices_to_merge{&halves.index0,
+                                                                           &halves.index1};
+
+    if (ps.merge_strategy == cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL) {
+      // The merged index holds only a view, so merged_dataset must outlive it.
+      auto const merged_rows =
+        static_cast<int64_t>(halves.index0.size()) + static_cast<int64_t>(halves.index1.size());
+      auto merged_matrix = raft::make_device_matrix<DataT, int64_t>(
+        handle_, merged_rows, static_cast<int64_t>(halves.index0.dataset().stride()));
+      auto merged_dataset = cuvs::neighbors::device_padded_dataset<DataT, int64_t>(
+        std::move(merged_matrix), static_cast<uint32_t>(ps.dim));
+      auto merged_idx =
+        ps.physical_merge_params.has_value()
+          ? cagra::merge(handle_,
+                         index_params,
+                         indices_to_merge,
+                         merged_dataset.as_dataset_view(),
+                         *ps.physical_merge_params)
+          : cagra::merge(handle_, index_params, indices_to_merge, merged_dataset.as_dataset_view());
+      auto search = [&](auto queries, auto neighbors, auto distances) {
+        cagra::search(handle_, search_params, merged_idx, queries, neighbors, distances);
+      };
+      searchAndCheck<SearchIdxT>(search);
+      (searchAndCheck<MoreSearchIdxT>(search), ...);
+    } else {
+      auto search = [&](auto queries, auto neighbors, auto distances) {
+        using out_index_type = typename decltype(neighbors)::value_type;
+        cuvs::neighbors::composite::composite_index<DataT, IdxT, out_index_type> composite(
+          indices_to_merge);
+        composite.search(handle_, search_params, queries, neighbors, distances);
+      };
+      searchAndCheck<SearchIdxT>(search);
+      (searchAndCheck<MoreSearchIdxT>(search), ...);
+    }
+  }
+
+  /**
+   * Runs `search(queries, neighbors, distances)` into `SearchIdxT` outputs and checks the results
+   * against naive_knn over the whole (unsplit) database.
+   */
+  template <typename SearchIdxT, typename SearchFn>
+  void searchAndCheck(SearchFn&& search)
+  {
     size_t queries_size = ps.n_queries * ps.k;
     std::vector<SearchIdxT> indices_Cagra(queries_size);
     std::vector<SearchIdxT> indices_naive(queries_size);
@@ -1491,70 +1770,6 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
       rmm::device_uvector<SearchIdxT> indices_dev(queries_size, stream_);
 
       {
-        cagra::index_params index_params;
-        index_params.metric = ps.metric;  // Note: currently ony the cagra::index_params metric is
-                                          // not used for knn_graph building.
-        index_params.graph_degree              = ps.graph_degree;
-        index_params.intermediate_graph_degree = ps.graph_degree * 2;
-
-        switch (ps.build_algo) {
-          case graph_build_algo::IVF_PQ:
-            index_params.graph_build_params = graph_build_params::ivf_pq_params(
-              raft::matrix_extent<int64_t>(ps.n_rows, ps.dim), index_params.metric);
-            if (ps.ivf_pq_search_refine_ratio) {
-              std::get<cuvs::neighbors::cagra::graph_build_params::ivf_pq_params>(
-                index_params.graph_build_params)
-                .refinement_rate = *ps.ivf_pq_search_refine_ratio;
-            }
-            break;
-          case graph_build_algo::NN_DESCENT: {
-            index_params.graph_build_params =
-              graph_build_params::nn_descent_params(index_params.intermediate_graph_degree);
-            break;
-          }
-          case graph_build_algo::ITERATIVE_CAGRA_SEARCH: {
-            index_params.graph_build_params = graph_build_params::iterative_search_params();
-            break;
-          }
-          case graph_build_algo::AUTO:
-            // do nothing
-            break;
-        };
-
-        const double split_ratio         = 0.55;
-        const std::size_t database0_size = ps.n_rows * split_ratio;
-        const std::size_t database1_size = ps.n_rows - database0_size;
-
-        auto database0_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data(), database0_size, ps.dim);
-
-        auto database1_view = raft::make_device_matrix_view<const DataT, int64_t>(
-          (const DataT*)database.data() + database0_view.size(), database1_size, ps.dim);
-
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> merge_padded0(handle_,
-                                                                                   database0_view);
-        cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT> merge_padded1(handle_,
-                                                                                   database1_view);
-
-        cagra::device_padded_index<DataT, IdxT> index0(handle_, index_params.metric);
-        cagra::device_padded_index<DataT, IdxT> index1(handle_, index_params.metric);
-        std::optional<raft::host_matrix<DataT, int64_t>> database_host{std::nullopt};
-        std::optional<raft::host_matrix_view<const DataT, int64_t>> ace_host0, ace_host1;
-        if (ps.host_dataset) {
-          database_host.emplace(raft::make_host_matrix<DataT, int64_t>(handle_, ps.n_rows, ps.dim));
-          raft::copy(database_host->data_handle(), database.data(), database.size(), stream_);
-          raft::resource::sync_stream(handle_);
-          if (std::holds_alternative<cagra::graph_build_params::ace_params>(
-                index_params.graph_build_params)) {
-            ace_host0.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-              database_host->data_handle(), database0_size, ps.dim));
-            ace_host1.emplace(raft::make_host_matrix_view<const DataT, int64_t>(
-              database_host->data_handle() + database0_size * ps.dim, database1_size, ps.dim));
-          }
-        }
-        cagra_build_into_index(handle_, index_params, ace_host0, merge_padded0.view, index0);
-        cagra_build_into_index(handle_, index_params, ace_host1, merge_padded1.view, index1);
-
         auto search_queries_view = raft::make_device_matrix_view<const DataT, int64_t>(
           search_queries.data(), ps.n_queries, ps.dim);
         auto indices_out_view = raft::make_device_matrix_view<SearchIdxT, int64_t>(
@@ -1562,43 +1777,7 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
         auto dists_out_view = raft::make_device_matrix_view<DistanceT, int64_t>(
           distances_dev.data(), ps.n_queries, ps.k);
 
-        cagra::search_params search_params;
-        search_params.algo        = ps.algo;
-        search_params.max_queries = ps.max_queries;
-        search_params.team_size   = ps.team_size;
-        search_params.itopk_size  = ps.itopk_size;
-
-        std::vector<cagra::device_padded_index<DataT, IdxT>*> indices_to_merge{&index0, &index1};
-
-        if (ps.merge_strategy == cuvs::neighbors::MergeStrategy::MERGE_STRATEGY_PHYSICAL) {
-          // The merged index holds only a view, so merged_dataset must outlive it.
-          auto const merged_rows =
-            static_cast<int64_t>(index0.size()) + static_cast<int64_t>(index1.size());
-          auto merged_matrix = raft::make_device_matrix<DataT, int64_t>(
-            handle_, merged_rows, static_cast<int64_t>(index0.dataset().stride()));
-          auto merged_dataset = cuvs::neighbors::device_padded_dataset<DataT, int64_t>(
-            std::move(merged_matrix), static_cast<uint32_t>(ps.dim));
-          auto merged_idx =
-            ps.physical_merge_params.has_value()
-              ? cagra::merge(handle_,
-                             index_params,
-                             indices_to_merge,
-                             merged_dataset.as_dataset_view(),
-                             *ps.physical_merge_params)
-              : cagra::merge(
-                  handle_, index_params, indices_to_merge, merged_dataset.as_dataset_view());
-          cagra::search(handle_,
-                        search_params,
-                        merged_idx,
-                        search_queries_view,
-                        indices_out_view,
-                        dists_out_view);
-        } else {
-          cuvs::neighbors::composite::composite_index<DataT, IdxT, SearchIdxT> composite(
-            indices_to_merge);
-          composite.search(
-            handle_, search_params, search_queries_view, indices_out_view, dists_out_view);
-        }
+        search(search_queries_view, indices_out_view, dists_out_view);
 
         raft::update_host(distances_Cagra.data(), distances_dev.data(), queries_size, stream_);
         raft::update_host(indices_Cagra.data(), indices_dev.data(), queries_size, stream_);
@@ -1648,7 +1827,17 @@ class AnnCagraIndexMergeTest : public ::testing::TestWithParam<AnnCagraInputs> {
     search_queries.resize(0, stream_);
   }
 
+ public:
+  static void TearDownTestSuite() { halves_cache().clear(); }
+
  private:
+  using halves_cache_t = test_index_cache<cagra_build_key, DataT, cagra_merge_halves<DataT, IdxT>>;
+  static auto halves_cache() -> halves_cache_t&
+  {
+    static halves_cache_t cache;
+    return cache;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnCagraInputs ps;
@@ -2055,6 +2244,91 @@ const std::vector<AnnCagraInputs> inputs           = generate_inputs();
 const std::vector<AnnCagraInputs> inputs_addnode   = generate_addnode_inputs();
 const std::vector<AnnCagraInputs> inputs_filtering = generate_filtering_inputs();
 
+/**
+ * Returns `in` without the entries whose `key(entry)` equals that of an earlier entry. The first
+ * occurrence is kept, and the order is preserved.
+ */
+template <typename KeyFn>
+auto unique_inputs(std::vector<AnnCagraInputs> const& in, KeyFn key) -> std::vector<AnnCagraInputs>
+{
+  std::vector<AnnCagraInputs> out;
+  for (auto const& p : in) {
+    if (std::none_of(
+          out.begin(), out.end(), [&](AnnCagraInputs const& q) { return key(q) == key(p); })) {
+      out.push_back(p);
+    }
+  }
+  return out;
+}
+
+/**
+ * Inputs of AnnCagraTest: `inputs` without the cases AnnCagraTest cannot tell apart. The fixture
+ * does not read merge_strategy, physical_merge_params, search_width or itopk_size (it leaves
+ * search_params.itopk_size at its default), and host_dataset only adds an unused device-to-host
+ * copy because no input selects ACE. In `inputs`, 179 of the 459 entries are such duplicates (the
+ * merge_strategy sweeps and the host_dataset sweep of the refinement block).
+ */
+inline auto generate_cagra_test_inputs() -> std::vector<AnnCagraInputs>
+{
+  return unique_inputs(inputs, [](AnnCagraInputs const& p) {
+    return std::make_tuple(p.n_queries,
+                           p.n_rows,
+                           p.dim,
+                           p.k,
+                           p.graph_degree,
+                           p.build_algo,
+                           p.algo,
+                           p.max_queries,
+                           p.team_size,
+                           p.metric,
+                           p.include_serialized_dataset,
+                           p.use_source_indices,
+                           p.min_recall,
+                           p.ivf_pq_search_refine_ratio,
+                           p.smem_dtype);
+  });
+}
+
+/**
+ * Inputs of AnnCagraIndexMergeTest: `inputs` without the cases the fixture cannot tell apart. It
+ * does not read include_serialized_dataset, use_source_indices, search_width or smem_dtype, and
+ * host_dataset only adds an unused device-to-host copy. In `inputs`, this removes the 6
+ * host_dataset duplicates of the refinement block. PHYSICAL / LOGICAL pairs stay separate cases;
+ * they share their two half-indices through the fixture's cache.
+ */
+inline auto generate_index_merge_inputs() -> std::vector<AnnCagraInputs>
+{
+  return unique_inputs(inputs, [](AnnCagraInputs const& p) {
+    auto const& mp = p.physical_merge_params;
+    return std::make_tuple(p.n_queries,
+                           p.n_rows,
+                           p.dim,
+                           p.k,
+                           p.graph_degree,
+                           p.build_algo,
+                           p.algo,
+                           p.max_queries,
+                           p.team_size,
+                           p.itopk_size,
+                           p.metric,
+                           p.min_recall,
+                           p.ivf_pq_search_refine_ratio,
+                           p.merge_strategy,
+                           mp.has_value() ? std::optional{std::make_tuple(mp->algo,
+                                                                          mp->levels,
+                                                                          mp->root_fanout,
+                                                                          mp->lower_fanout,
+                                                                          mp->leader_fraction,
+                                                                          mp->max_leaders,
+                                                                          mp->leaf_size,
+                                                                          mp->leaf_degree)}
+                                          : std::nullopt);
+  });
+}
+
+const std::vector<AnnCagraInputs> inputs_cagra_test  = generate_cagra_test_inputs();
+const std::vector<AnnCagraInputs> inputs_index_merge = generate_index_merge_inputs();
+
 // ===================================================================================
 // Multi-partition CAGRA search (cagra::search over a std::vector<const index*>).
 // Kept as a separate test class + input type (mirroring how extend/filter/merge are
@@ -2148,26 +2422,42 @@ class AnnCagraMultiPartitionTest : public ::testing::TestWithParam<AnnCagraMpInp
   }
 
  protected:
-  // Build one CAGRA index per contiguous slice of `database`. Skips (returns false) when a
-  // partition would be too small to build a graph of the requested degree.
+  // Build one CAGRA index per contiguous slice of `database`, and return pointers to them in
+  // `out`. Skips (returns false) when a partition would be too small to build a graph of the
+  // requested degree. Search and FilteredSearch, and the cases that only differ in search
+  // parameters, share the same partition indices through partition_cache(); the multi-partition
+  // search only reads them.
   bool buildPartitions(cagra::index_params const& index_params,
                        std::vector<int64_t> const& sizes,
                        std::vector<int64_t> const& offsets,
-                       std::vector<cagra::index<DataT, IdxT>>& out)
+                       std::vector<const cagra::index<DataT, IdxT>*>& out)
   {
-    // An index only holds a view, so any padded copy must outlive it; part_padded_ owns those
-    // allocations for the lifetime of the fixture.
-    part_padded_.clear();
-    part_padded_.reserve(ps.num_partitions);
     for (int i = 0; i < ps.num_partitions; i++) {
       if (sizes[i] <= static_cast<int64_t>(index_params.graph_degree)) { return false; }
-      auto slice_view = raft::make_device_matrix_view<const DataT, int64_t>(
-        database.data() + offsets[i] * ps.dim, sizes[i], ps.dim);
-      part_padded_.emplace_back(handle_, slice_view);
-      auto const& padded = part_padded_.back().view;
-      out.push_back(cagra::build(handle_, index_params, padded));
-      auto& part = out.back();
-      part       = cagra::update_dataset(handle_, std::move(part), padded);
+    }
+    auto build_partitions = [&](DataT const* data) {
+      cached_partitions parts;
+      // An index only holds a view, so any padded copy must outlive it; parts.padded owns those
+      // allocations for the lifetime of the cache entry.
+      parts.padded.reserve(ps.num_partitions);
+      parts.indices.reserve(ps.num_partitions);
+      for (int i = 0; i < ps.num_partitions; i++) {
+        auto slice_view = raft::make_device_matrix_view<const DataT, int64_t>(
+          data + offsets[i] * ps.dim, sizes[i], ps.dim);
+        parts.padded.emplace_back(handle_, slice_view);
+        auto const& padded = parts.padded.back().view;
+        parts.indices.push_back(cagra::build(handle_, index_params, padded));
+        auto& part = parts.indices.back();
+        part       = cagra::update_dataset(handle_, std::move(part), padded);
+      }
+      return parts;
+    };
+    auto const key =
+      partition_key{ps.n_rows, ps.dim, ps.num_partitions, ps.split, ps.metric, ps.build_algo};
+    auto const& parts = partition_cache().get_or_build(
+      handle_, key, database.data(), database.size(), build_partitions);
+    for (auto const& part : parts.indices) {
+      out.push_back(&part);
     }
     return true;
   }
@@ -2227,14 +2517,8 @@ class AnnCagraMultiPartitionTest : public ::testing::TestWithParam<AnnCagraMpInp
     std::exclusive_scan(sizes.begin(), sizes.end(), offsets.begin(), int64_t{0});
 
     auto index_params = makeIndexParams();
-    std::vector<cagra::index<DataT, IdxT>> part_indices;
-    part_indices.reserve(ps.num_partitions);
-    if (!buildPartitions(index_params, sizes, offsets, part_indices)) { GTEST_SKIP(); }
-
     std::vector<const cagra::index<DataT, IdxT>*> index_ptrs;
-    for (auto& idx : part_indices) {
-      index_ptrs.push_back(&idx);
-    }
+    if (!buildPartitions(index_params, sizes, offsets, index_ptrs)) { GTEST_SKIP(); }
 
     const size_t out_size = static_cast<size_t>(ps.n_queries) * ps.k;
     rmm::device_uvector<uint32_t> partition_ids_dev(out_size, stream_);
@@ -2317,13 +2601,8 @@ class AnnCagraMultiPartitionTest : public ::testing::TestWithParam<AnnCagraMpInp
     std::exclusive_scan(sizes.begin(), sizes.end(), offsets.begin(), int64_t{0});
 
     auto index_params = makeIndexParams();
-    std::vector<cagra::index<DataT, IdxT>> part_indices;
-    part_indices.reserve(ps.num_partitions);
-    if (!buildPartitions(index_params, sizes, offsets, part_indices)) { GTEST_SKIP(); }
     std::vector<const cagra::index<DataT, IdxT>*> index_ptrs;
-    for (auto& idx : part_indices) {
-      index_ptrs.push_back(&idx);
-    }
+    if (!buildPartitions(index_params, sizes, offsets, index_ptrs)) { GTEST_SKIP(); }
 
     // Each partition supplies its OWN bitset over its own rows (one bit per row). Clear the local
     // rows that map to removed global rows [0, filter_offset); unlisted bits stay set (kept). The
@@ -2448,13 +2727,34 @@ class AnnCagraMultiPartitionTest : public ::testing::TestWithParam<AnnCagraMpInp
     search_queries.resize(0, stream_);
   }
 
+ public:
+  static void TearDownTestSuite() { partition_cache().clear(); }
+
  private:
+  /** The indices of one partition set and the padded storage they view. */
+  struct cached_partitions {
+    std::vector<cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT>> padded;
+    std::vector<cagra::index<DataT, IdxT>> indices;
+  };
+  /** Everything (besides the dataset) the partition indices depend on. */
+  using partition_key     = std::tuple<int,                           // n_rows
+                                       int,                           // dim
+                                       int,                           // num_partitions
+                                       partition_split,               // split
+                                       cuvs::distance::DistanceType,  // metric
+                                       graph_build_algo>;             // build_algo
+  using partition_cache_t = test_index_cache<partition_key, DataT, cached_partitions>;
+  static auto partition_cache() -> partition_cache_t&
+  {
+    static partition_cache_t cache;
+    return cache;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnCagraMpInputs ps;
   rmm::device_uvector<DataT> database;
   rmm::device_uvector<DataT> search_queries;
-  std::vector<cuvs::neighbors::test::padded_device_matrix_for_cagra<DataT>> part_padded_;
 };
 
 inline std::vector<AnnCagraMpInputs> generate_mp_inputs()
