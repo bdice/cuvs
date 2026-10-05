@@ -19,6 +19,13 @@
 #include <rmm/mr/managed_memory_resource.hpp>
 #include <thrust/sequence.h>
 
+#include <memory>
+#include <optional>
+#include <tuple>
+#include <typeindex>
+#include <typeinfo>
+#include <utility>
+
 namespace cuvs::neighbors::ivf_pq {
 
 struct test_ivf_sample_filter {
@@ -136,6 +143,82 @@ auto min_output_size(const raft::resources& handle,
   }
   return acc_sizes(last_nonzero) - acc_sizes(last_nonzero - std::min(last_nonzero, n_probes));
 }
+
+/**
+ * The parameters that determine the index built by a test case: the build path (`build_path`
+ * identifies the build function of the TEST_P), the dataset, and the index parameters.
+ * `gen_data()` generates the data from a fixed seed, so for a given data type it depends only on
+ * the sizes. Cases with equal keys differ only in `k`, `min_recall` or `search_params`, and they
+ * build the same index.
+ *
+ * NB: keep this in sync with the fields of `ivf_pq::index_params`.
+ */
+inline auto make_index_key(std::type_index build_path, const ivf_pq_inputs& p)
+{
+  const auto& ip = p.index_params;
+  return std::make_tuple(build_path,
+                         p.num_db_vecs,
+                         p.num_queries,
+                         p.dim,
+                         ip.metric,
+                         ip.metric_arg,
+                         ip.n_lists,
+                         ip.kmeans_n_iters,
+                         ip.kmeans_trainset_fraction,
+                         ip.pq_bits,
+                         ip.pq_dim,
+                         ip.codebook_kind,
+                         ip.codes_layout,
+                         ip.force_random_rotation,
+                         ip.conservative_memory_allocation,
+                         ip.add_data_on_build,
+                         ip.max_train_points_per_pq_code);
+}
+
+/**
+ * Keeps the index built (and checked) by the previous test case, so that the following cases with
+ * the same key (see `make_index_key`) search it instead of building the same index again.
+ *
+ * Only one index is kept to bound the GPU memory usage, so the parameter lists put the cases that
+ * share an index next to each other. The fixtures release the index in `TearDownTestSuite`.
+ * A case run on its own (e.g. with `--gtest_filter`) builds its own index.
+ */
+template <typename IdxT>
+class last_index_cache {
+ public:
+  using key_type =
+    decltype(make_index_key(std::declval<std::type_index>(), std::declval<ivf_pq_inputs>()));
+
+  /**
+   * Whether the cached entry has the given key. If not, the cached index is released, so that the
+   * caller can build a new one without holding two indices in memory.
+   */
+  auto lookup(const key_type& key) -> bool
+  {
+    if (key_.has_value() && *key_ == key) { return true; }
+    clear();
+    return false;
+  }
+
+  /** The cached index, or nullptr if only the key was stored. */
+  [[nodiscard]] auto get() const -> const index<IdxT>* { return index_.get(); }
+
+  void put(key_type key, std::unique_ptr<index<IdxT>> idx)
+  {
+    key_.emplace(std::move(key));
+    index_ = std::move(idx);
+  }
+
+  void clear()
+  {
+    index_.reset();
+    key_.reset();
+  }
+
+ private:
+  std::optional<key_type> key_;
+  std::unique_ptr<index<IdxT>> index_;
+};
 
 template <typename EvalT, typename DataT, typename IdxT>
 class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
@@ -269,6 +352,14 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
 
   void build_precomputed()
   {
+    // This test doesn't search, so a case that differs from the previous one only in the search
+    // parameters would repeat exactly the same builds and checks.
+    struct build_precomputed_path {};
+    auto key = make_index_key(typeid(build_precomputed_path), ps);
+    if (index_cache_.lookup(key)) {
+      GTEST_SKIP() << "Same as the previous case: this test does not use the search parameters.";
+    }
+
     auto ipams              = ps.index_params;
     ipams.add_data_on_build = false;
     auto database_view =
@@ -313,6 +404,9 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
                                   view_index.list_sizes().data_handle(),
                                   base_index.n_lists(),
                                   cuvs::Compare<uint32_t>{}));
+
+    // Only the key is needed to skip the repeated cases; don't keep the indices.
+    if (!HasFailure()) { index_cache_.put(std::move(key), nullptr); }
   }
 
   void check_reconstruction(const index<IdxT>& index,
@@ -590,31 +684,58 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
       << "Recall mismatch between original interleaved and repacked-from-flat indexes";
   }
 
-  template <typename BuildIndex>
-  void run(BuildIndex build_index)
+  auto get_compression_ratio(const index<IdxT>& index) const -> double
   {
-    index<IdxT> index = build_index();
+    return static_cast<double>(ps.dim * 8) / static_cast<double>(index.pq_dim() * index.pq_bits());
+  }
 
-    double compression_ratio =
-      static_cast<double>(ps.dim * 8) / static_cast<double>(index.pq_dim() * index.pq_bits());
+  /** Check the codepacking helpers on all lists of the index. NB: this rewrites the lists. */
+  void check_lists(index<IdxT>* index)
+  {
+    double compression_ratio = get_compression_ratio(*index);
 
-    for (uint32_t label = 0; label < index.n_lists(); label++) {
+    for (uint32_t label = 0; label < index->n_lists(); label++) {
       switch (label % 3) {
         case 0: {
           // Reconstruct and re-write vectors for one label
-          check_reconstruct_extend(&index, compression_ratio, label);
+          check_reconstruct_extend(index, compression_ratio, label);
         } break;
         case 1: {
           // Dump and re-write codes for one label
-          check_packing(&index, label);
+          check_packing(index, label);
         } break;
         default: {
           // check a small subset of data in a randomly chosen cluster to see if the data
           // reconstruction works well.
-          check_reconstruction(index, compression_ratio, label, 100, 7);
+          check_reconstruction(*index, compression_ratio, label, 100, 7);
         }
       }
     }
+  }
+
+  template <typename BuildIndex>
+  void run(BuildIndex build_index)
+  {
+    // If this case differs from the previous one only in the search parameters, search the index
+    // that the previous case built and checked. Each TEST_P passes its own lambda, so the lambda
+    // type identifies the build path.
+    auto key = make_index_key(typeid(BuildIndex), ps);
+    std::unique_ptr<index<IdxT>> uncached_index;
+    if (!index_cache_.lookup(key)) {
+      auto new_index = std::make_unique<index<IdxT>>(build_index());
+      // These checks rewrite the lists. The cases that reuse the index search it in this same
+      // (checked) state and don't run the checks again.
+      check_lists(new_index.get());
+      // Don't cache an index that failed the checks: the next cases would skip them.
+      if (HasFailure()) {
+        uncached_index = std::move(new_index);
+      } else {
+        index_cache_.put(std::move(key), std::move(new_index));
+      }
+    }
+    const auto& index = uncached_index ? *uncached_index : *index_cache_.get();
+
+    double compression_ratio = get_compression_ratio(index);
 
     size_t queries_size = ps.num_queries * ps.k;
     std::vector<IdxT> indices_ivf_pq(queries_size);
@@ -704,6 +825,8 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
     search_queries.resize(0, stream_);
   }
 
+  static void TearDownTestSuite() { index_cache_.clear(); }  // NOLINT
+
  private:
   raft::resources handle_;
   cuda::stream_ref stream_;
@@ -712,6 +835,8 @@ class ivf_pq_test : public ::testing::TestWithParam<ivf_pq_inputs> {
   rmm::device_uvector<DataT> search_queries;  // NOLINT
   std::vector<IdxT> indices_ref;              // NOLINT
   std::vector<EvalT> distances_ref;           // NOLINT
+
+  static inline last_index_cache<IdxT> index_cache_;  // NOLINT
 };
 
 /**
@@ -794,7 +919,14 @@ class ivf_pq_filter_test : public ::testing::TestWithParam<ivf_pq_inputs> {
   template <typename BuildIndex>
   void run(BuildIndex build_index)
   {
-    index<IdxT> index = build_index();
+    // If this case differs from the previous one only in the search parameters, search the index
+    // that the previous case built. Each TEST_P passes its own lambda, so the lambda type
+    // identifies the build path.
+    auto key = make_index_key(typeid(BuildIndex), ps);
+    if (!index_cache_.lookup(key)) {
+      index_cache_.put(std::move(key), std::make_unique<index<IdxT>>(build_index()));
+    }
+    const auto& index = *index_cache_.get();
 
     double compression_ratio =
       static_cast<double>(ps.dim * 8) / static_cast<double>(index.pq_dim() * index.pq_bits());
@@ -866,6 +998,8 @@ class ivf_pq_filter_test : public ::testing::TestWithParam<ivf_pq_inputs> {
     search_queries.resize(0, stream_);
   }
 
+  static void TearDownTestSuite() { index_cache_.clear(); }  // NOLINT
+
  private:
   raft::resources handle_;
   cuda::stream_ref stream_;
@@ -874,6 +1008,8 @@ class ivf_pq_filter_test : public ::testing::TestWithParam<ivf_pq_inputs> {
   rmm::device_uvector<DataT> search_queries;  // NOLINT
   std::vector<IdxT> indices_ref;              // NOLINT
   std::vector<EvalT> distances_ref;           // NOLINT
+
+  static inline last_index_cache<IdxT> index_cache_;  // NOLINT
 };
 
 /* Test cases */
@@ -976,6 +1112,9 @@ __attribute__((noinline)) void add_test_case(test_cases_t& xs, F&& modifier)
 
 /**
  * A minimal set of tests to check various enum-like parameters.
+ *
+ * Every case is distinct. The cases that differ only in the search parameters are kept next to
+ * each other, so that they can reuse the same index (see `last_index_cache`).
  */
 inline auto enum_variety() -> test_cases_t
 {
@@ -983,10 +1122,6 @@ inline auto enum_variety() -> test_cases_t
 
   add_test_case(xs, [](ivf_pq_inputs& x) {
     x.index_params.codebook_kind = ivf_pq::codebook_gen::PER_CLUSTER;
-    x.min_recall                 = 0.86;
-  });
-  add_test_case(xs, [](ivf_pq_inputs& x) {
-    x.index_params.codebook_kind = ivf_pq::codebook_gen::PER_SUBSPACE;
     x.min_recall                 = 0.86;
   });
   add_test_case(xs, [](ivf_pq_inputs& x) {
@@ -1008,24 +1143,24 @@ inline auto enum_variety() -> test_cases_t
     x.index_params.pq_bits = 7;
     x.min_recall           = 0.85;
   });
-  add_test_case(xs, [](ivf_pq_inputs& x) {
-    x.index_params.pq_bits = 8;
-    x.min_recall           = 0.86;
-  });
 
   add_test_case(xs, [](ivf_pq_inputs& x) {
     x.index_params.force_random_rotation = true;
     x.min_recall                         = 0.86;
   });
-  add_test_case(xs, [](ivf_pq_inputs& x) {
-    x.index_params.force_random_rotation = false;
-    x.min_recall                         = 0.86;
-  });
 
+  // codebook_kind = PER_SUBSPACE, pq_bits = 8, force_random_rotation = false,
+  // lut_dtype = CUDA_R_32F and internal_distance_dtype = CUDA_R_32F are the defaults, so a single
+  // case covers them all.
   add_test_case(xs, [](ivf_pq_inputs& x) {
-    x.search_params.lut_dtype = CUDA_R_32F;
-    x.min_recall              = 0.86;
+    x.index_params.codebook_kind            = ivf_pq::codebook_gen::PER_SUBSPACE;
+    x.index_params.pq_bits                  = 8;
+    x.index_params.force_random_rotation    = false;
+    x.search_params.lut_dtype               = CUDA_R_32F;
+    x.search_params.internal_distance_dtype = CUDA_R_32F;
+    x.min_recall                            = 0.86;
   });
+  // The rest differ from the default only in the search parameters.
   add_test_case(xs, [](ivf_pq_inputs& x) {
     x.search_params.lut_dtype = CUDA_R_16F;
     x.min_recall              = 0.86;
@@ -1046,10 +1181,6 @@ inline auto enum_variety() -> test_cases_t
     x.min_recall = 0.1;
   });
 
-  add_test_case(xs, [](ivf_pq_inputs& x) {
-    x.search_params.internal_distance_dtype = CUDA_R_32F;
-    x.min_recall                            = 0.86;
-  });
   add_test_case(xs, [](ivf_pq_inputs& x) {
     x.search_params.internal_distance_dtype = CUDA_R_16F;
     x.search_params.lut_dtype               = CUDA_R_16F;
