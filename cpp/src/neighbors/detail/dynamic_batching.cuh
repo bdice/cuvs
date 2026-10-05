@@ -352,7 +352,9 @@ struct batch_queue_t {
       rem_time_us_(i).store(std::numeric_limits<int32_t>::max(), kMemOrder);
       if (batch_sizes_.has_value()) { batch_sizes_.value()(i).store(0, kMemOrder); }
       dispatch_sequence_id_[i].store(past_seq_id.value, kMemOrder);
-      failed_sequence_id_[i].store(past_seq_id.value, kMemOrder);
+      // kCounterIncrement is odd, hence i + 1 is never a sequence id of slot i and a slot that
+      // has not failed can never match the check in `search`.
+      failed_sequence_id_[i].store(i + 1, kMemOrder);
       tokens_(i).store(make_empty_token(past_seq_id), kMemOrder);
     }
   }
