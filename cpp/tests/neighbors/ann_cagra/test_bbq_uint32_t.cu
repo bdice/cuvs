@@ -9,6 +9,8 @@
 
 namespace cuvs::neighbors::cagra {
 
+// The cases of one parameter set share one BBQ graph build, and the cases of one metric share one
+// dense reference build (AnnCagraBbqTest::bbq_build, AnnCagraBbqTest::dense_reference_recall).
 TEST_P(AnnCagraBbqTest, AnnCagraBbqSearchRecall) { this->testSearchRecall(); }
 TEST_P(AnnCagraBbqTest, AnnCagraBbqGraphShape) { this->testGraphShape(); }
 TEST_P(AnnCagraBbqTest, AnnCagraBbqGraphOnlyBuild) { this->testGraphOnlyBuild(); }

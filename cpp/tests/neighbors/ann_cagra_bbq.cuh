@@ -11,6 +11,7 @@
 #include <cuvs_internal/preprocessing/bbq_cpu_quantize.hpp>
 
 #include <raft/core/host_mdarray.hpp>
+#include <raft/core/host_mdspan.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/random/rng.cuh>
 
@@ -19,6 +20,7 @@
 #include <cuda/stream>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <tuple>
@@ -65,7 +67,56 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
   {
   }
 
+  /** Drop the graphs and reference recalls shared between the cases of this suite. */
+  static void TearDownTestSuite()
+  {
+    bbq_builds_.clear();
+    dense_reference_recalls_.clear();
+  }
+
  protected:
+  using bbq_code_layout = cuvs::preprocessing::quantize::bbq::bbq_code_layout;
+
+  /** Seed of the generator SetUp() draws the database and the queries from. */
+  static constexpr uint64_t kDataSeed = 1234ULL;
+
+  /**
+   * Everything the database, the queries, the ground truth and default_index_params() depend on;
+   * this keys the dense reference build. The code layouts and the recall threshold are left out
+   * on purpose: the dense build does not see them.
+   */
+  using dense_key_type =
+    std::tuple<uint64_t, int, int, int, int, int, cuvs::distance::DistanceType>;
+  /** dense_key_type plus the code layouts: everything the BBQ graph depends on. */
+  using bbq_key_type = std::tuple<dense_key_type, bbq_code_layout, std::optional<bbq_code_layout>>;
+
+  [[nodiscard]] auto dense_key() const -> dense_key_type
+  {
+    return {kDataSeed, ps.n_queries, ps.n_rows, ps.dim, ps.k, ps.graph_degree, ps.metric};
+  }
+
+  [[nodiscard]] auto bbq_key() const -> bbq_key_type
+  {
+    return {dense_key(), ps.layout, ps.second_layout};
+  }
+
+  /** What the single BBQ `cagra::build` of a parameter set returned. */
+  struct bbq_build_result {
+    /** The optimized graph. Kept on the host, so every test binds its own device copy. */
+    std::vector<uint32_t> graph;
+    cuvs::distance::DistanceType metric;
+    uint32_t graph_size;
+    uint32_t graph_degree;
+    int64_t dataset_rows;
+    bool quantizers_empty;
+
+    [[nodiscard]] auto graph_view() const
+    {
+      return raft::make_host_matrix_view<const uint32_t, int64_t>(
+        graph.data(), graph_size, graph_degree);
+    }
+  };
+
   /** Quantize the float database on the host and upload the codes. */
   auto quantize_database() -> cuvs::neighbors::device_bbq_dataset<float, int64_t>
   {
@@ -93,6 +144,70 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
     params.graph_build_params =
       cagra::graph_build_params::nn_descent_params(params.intermediate_graph_degree, ps.metric);
     return params;
+  }
+
+  /**
+   * The BBQ graph of the current parameter set. Graph construction dominates this suite's run time
+   * and does not depend on the test, so the tests of a parameter set share one `cagra::build`.
+   *
+   * It runs with `attach_dataset_on_build = false`, the path testGraphOnlyBuild() checks; the
+   * graph does not depend on that flag. bbq_index() then binds the codes the way the default path
+   * does. Only a host copy of the graph is cached: the cache holds no device memory, and every
+   * test builds, moves and serializes its own index.
+   */
+  auto bbq_build() -> bbq_build_result const&
+  {
+    const auto key = bbq_key();
+    if (auto it = bbq_builds_.find(key); it != bbq_builds_.end()) { return it->second; }
+
+    auto params                    = default_index_params();
+    params.attach_dataset_on_build = false;
+
+    auto owning_codes = quantize_database();
+    auto index        = cagra::build(handle_, params, owning_codes.as_dataset_view());
+
+    bbq_build_result result{std::vector<uint32_t>(index.graph().size()),
+                            index.metric(),
+                            index.graph_size(),
+                            index.graph_degree(),
+                            index.dataset().n_rows(),
+                            index.dataset().quantizers.empty()};
+    raft::copy(result.graph.data(), index.graph().data_handle(), result.graph.size(), stream_);
+    raft::resource::sync_stream(handle_);
+    return bbq_builds_.emplace(key, std::move(result)).first->second;
+  }
+
+  /**
+   * The index `cagra::build` returns by default (`attach_dataset_on_build = true`): the graph of
+   * @p built bound to the codes through the same constructor the build uses for that.
+   * @p owning_codes backs the view held by the index, so it must outlive it.
+   */
+  auto bbq_index(bbq_build_result const& built,
+                 cuvs::neighbors::device_bbq_dataset<float, int64_t> const& owning_codes)
+    -> device_bbq_index<float>
+  {
+    return device_bbq_index<float>(
+      handle_, built.metric, owning_codes.as_dataset_view(), built.graph_view());
+  }
+
+  /**
+   * Recall of a graph built from the full-precision database: the bar testSearchRecall() holds the
+   * BBQ build to. It does not depend on the code layouts, so it is computed once per dense_key().
+   */
+  auto dense_reference_recall(
+    cuvs::neighbors::device_padded_dataset_view<float, int64_t> const& dataset,
+    std::vector<uint32_t> const& ground_truth) -> double
+  {
+    const auto key = dense_key();
+    if (auto it = dense_reference_recalls_.find(key); it != dense_reference_recalls_.end()) {
+      return it->second;
+    }
+
+    auto dense_index    = cagra::build(handle_, default_index_params(), dataset);
+    dense_index         = cagra::update_dataset(handle_, std::move(dense_index), dataset);
+    const double recall = search_recall(dense_index, ground_truth);
+    dense_reference_recalls_.emplace(key, recall);
+    return recall;
   }
 
   /** Brute-force top-k over the current database, as the ground truth for recall. */
@@ -170,19 +285,14 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
     cuvs::neighbors::test::padded_device_matrix_for_cagra<float> device_padded(handle_,
                                                                                database_view);
 
-    double reference_recall = 0.0;
-    {
-      auto dense_index = cagra::build(handle_, default_index_params(), device_padded.view);
-      dense_index      = cagra::update_dataset(handle_, std::move(dense_index), device_padded.view);
-      reference_recall = search_recall(dense_index, ground_truth);
-    }
+    const double reference_recall = dense_reference_recall(device_padded.view, ground_truth);
 
     double bbq_recall = 0.0;
     {
-      // `owning_codes` backs the view held by the built index, so it must outlive it.
+      auto const& built = bbq_build();
+      // `owning_codes` backs the view held by the index, so it must outlive it.
       auto owning_codes = quantize_database();
-      auto graph_index =
-        cagra::build(handle_, default_index_params(), owning_codes.as_dataset_view());
+      auto graph_index  = bbq_index(built, owning_codes);
       ASSERT_EQ(graph_index.graph_size(), static_cast<uint32_t>(ps.n_rows));
 
       // Rebinding the uncompressed vectors is what makes the BBQ-built graph searchable.
@@ -211,8 +321,9 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
   /** The optimized graph has the requested shape and refers only to existing rows. */
   void testGraphShape()
   {
+    auto const& built = bbq_build();
     auto owning_codes = quantize_database();
-    auto index = cagra::build(handle_, default_index_params(), owning_codes.as_dataset_view());
+    auto index        = bbq_index(built, owning_codes);
 
     ASSERT_EQ(index.graph_size(), static_cast<uint32_t>(ps.n_rows));
     ASSERT_EQ(index.graph_degree(), static_cast<uint32_t>(ps.graph_degree));
@@ -248,9 +359,9 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
     cuvs::neighbors::test::padded_device_matrix_for_cagra<float> device_padded(handle_,
                                                                                database_view);
 
+    auto const& built = bbq_build();
     auto owning_codes = quantize_database();
-    auto graph_index =
-      cagra::build(handle_, default_index_params(), owning_codes.as_dataset_view());
+    auto graph_index  = bbq_index(built, owning_codes);
 
     std::stringstream stored;
     cagra::serialize(handle_, stored, graph_index);
@@ -277,16 +388,13 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
   /** `attach_dataset_on_build = false` yields a graph without any dataset binding. */
   void testGraphOnlyBuild()
   {
-    auto params                    = default_index_params();
-    params.attach_dataset_on_build = false;
+    // bbq_build() is that build; check what it returned.
+    auto const& built = bbq_build();
 
-    auto owning_codes = quantize_database();
-    auto index        = cagra::build(handle_, params, owning_codes.as_dataset_view());
-
-    ASSERT_EQ(index.graph_size(), static_cast<uint32_t>(ps.n_rows));
-    ASSERT_EQ(index.graph_degree(), static_cast<uint32_t>(ps.graph_degree));
-    EXPECT_EQ(index.dataset().n_rows(), 0);
-    EXPECT_TRUE(index.dataset().quantizers.empty());
+    ASSERT_EQ(built.graph_size, static_cast<uint32_t>(ps.n_rows));
+    ASSERT_EQ(built.graph_degree, static_cast<uint32_t>(ps.graph_degree));
+    EXPECT_EQ(built.dataset_rows, 0);
+    EXPECT_TRUE(built.quantizers_empty);
   }
 
   /** Only NN-descent graph construction and the four BBQ metrics are accepted. */
@@ -318,7 +426,7 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
     }
     database.resize(static_cast<size_t>(ps.n_rows) * ps.dim, stream_);
     search_queries.resize(static_cast<size_t>(ps.n_queries) * ps.dim, stream_);
-    raft::random::RngState r(1234ULL);
+    raft::random::RngState r(kDataSeed);
     InitDataset(handle_, database.data(), ps.n_rows, ps.dim, ps.metric, r);
     InitDataset(handle_, search_queries.data(), ps.n_queries, ps.dim, ps.metric, r);
     raft::resource::sync_stream(handle_);
@@ -337,6 +445,13 @@ class AnnCagraBbqTest : public ::testing::TestWithParam<AnnCagraBbqInputs> {
   AnnCagraBbqInputs ps;
   rmm::device_uvector<float> database;
   rmm::device_uvector<float> search_queries;
+
+  // Shared between the cases of this suite and cleared in TearDownTestSuite(). Host memory only:
+  // one graph_size x graph_degree graph per parameter set (~0.5 MiB each here) and one recall per
+  // dense key. gtest runs all parameter sets of one TEST_P before the next TEST_P, so a cache of
+  // only the most recent parameter set would never hit.
+  static inline std::map<bbq_key_type, bbq_build_result> bbq_builds_{};
+  static inline std::map<dense_key_type, double> dense_reference_recalls_{};
 };
 
 /**
