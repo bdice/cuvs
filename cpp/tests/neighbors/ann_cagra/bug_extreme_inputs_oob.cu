@@ -10,9 +10,11 @@
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
+#include <raft/core/error.hpp>
 #include <raft/random/rng.cuh>
 
 #include <cstdint>
+#include <string>
 
 namespace cuvs::neighbors::cagra {
 
@@ -25,21 +27,27 @@ class cagra_extreme_inputs_oob_test : public ::testing::Test {
   {
     cagra::index_params ix_ps;
     graph_build_params::ivf_pq_params gb_params{};
-    gb_params.refinement_rate       = 2;
+    gb_params.refinement_rate = 2;
+    // Keep ~100 rows per IVF list, as with the default 1024 lists on the original 100k rows.
+    gb_params.build_params.n_lists  = 100;
     ix_ps.graph_build_params        = gb_params;
     ix_ps.graph_degree              = 64;
     ix_ps.intermediate_graph_degree = 128;
 
+    cuvs::neighbors::test::padded_device_matrix_for_cagra<data_type> padded(
+      res, raft::make_const_mdspan(dataset->view()));
+    // The squared distances between these vectors overflow, so the kNN search (IVF-PQ + refine)
+    // yields invalid or duplicated neighbors. The build must not access memory out of bounds
+    // because of them (in refine or when pruning), but reject the kNN graph when pruning it.
     try {
-      cuvs::neighbors::test::padded_device_matrix_for_cagra<data_type> padded(
-        res, raft::make_const_mdspan(dataset->view()));
       [[maybe_unused]] auto ix = cagra::build(res, ix_ps, padded.view);
       raft::resource::sync_stream(res);
-    } catch (const std::exception&) {
-      SUCCEED();
-      return;
+      FAIL() << "cagra::build did not reject the kNN graph of the extreme inputs";
+    } catch (const raft::logic_error& e) {
+      EXPECT_NE(std::string(e.what()).find("invalid or duplicated neighbor nodes"),
+                std::string::npos)
+        << e.what();
     }
-    FAIL();
   }
 
   void SetUp() override
@@ -61,7 +69,7 @@ class cagra_extreme_inputs_oob_test : public ::testing::Test {
   raft::resources res;
   std::optional<raft::device_matrix<data_type, int64_t>> dataset = std::nullopt;
 
-  constexpr static int64_t n_samples                   = 100000;
+  constexpr static int64_t n_samples                   = 10000;
   constexpr static int64_t n_dim                       = 200;
   constexpr static cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2Expanded;
 };
