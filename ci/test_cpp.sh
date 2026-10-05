@@ -43,6 +43,7 @@ if [[ "${CUDA_CACHE_PATH}" != /* ]]; then
 fi
 export CUDA_CACHE_PATH
 mkdir -p "${CUDA_CACHE_PATH}"
+rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files before the tests"
 
 rapids-print-env
 
@@ -81,6 +82,9 @@ if [[ "${SHARD}" == "1" && "${KVIKIO_COMPAT_MODE}" == "ON" ]]; then
   KVIKIO_COMPAT_MODE=AUTO ctest --output-on-failure -R '^UTIL_TEST$'
 fi
 popd
+
+# Every kernel that was not in the restored cache and had to be linked adds files.
+rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files ($(du -sh "${CUDA_CACHE_PATH}" | cut -f1)) after the tests"
 
 rapids-logger "Test script exiting with value: $EXITCODE"
 exit ${EXITCODE}
