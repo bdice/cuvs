@@ -8,6 +8,7 @@
 
 #if __has_include(<kvikio/compat_mode.hpp>)
 #include <kvikio/compat_mode.hpp>
+#include <kvikio/defaults.hpp>
 #define CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER 1
 #else
 #define CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER 0
@@ -54,8 +55,18 @@ inline kvikio::FileHandle open_kvikio_file_compat_off(const std::string& path,
 inline kvikio::FileHandle open_kvikio_file_for_device_io(const std::string& path,
                                                          const std::string& flags)
 {
-  // Prefer GDS for device transfers, but retain KvikIO's automatic POSIX fallback when the
-  // current system cannot open the file with compatibility mode disabled.
+#if CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER
+  // Honour an explicit request for POSIX I/O (KVIKIO_COMPAT_MODE=ON, or
+  // kvikio::defaults::set_compat_mode(kvikio::CompatMode::ON)). Forcing CompatMode::OFF below
+  // registers the file with cuFile, which initializes the cuFile driver (about 1 s per process)
+  // even though KvikIO was asked not to use cuFile.
+  if (kvikio::defaults::compat_mode() == kvikio::CompatMode::ON) {
+    return kvikio::FileHandle(path, flags, kvikio::FileHandle::m644, kvikio::CompatMode::ON);
+  }
+#endif
+
+  // Otherwise prefer GDS for device transfers, but retain KvikIO's automatic POSIX fallback when
+  // the current system cannot open the file with compatibility mode disabled.
   try {
     return open_kvikio_file_compat_off(path, flags, 0);
   } catch (const std::exception& e) {

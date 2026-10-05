@@ -64,10 +64,22 @@ if [[ "${SHARD}" == "1" ]]; then
   pytest cpp/tests/python
 fi
 
+# Unless KvikIO's compatibility mode is ON, libcuvs opens files for device I/O through cuFile. That
+# initializes the cuFile driver, about 1 s in every test process that saves or loads an index, and
+# without GPUDirect Storage (not expected on the CI runners) cuFile then only falls back to POSIX
+# I/O. Use KvikIO's POSIX backend for the gtests; a job can override this by setting
+# KVIKIO_COMPAT_MODE itself. UTIL_TEST is rerun below in the default mode to keep the cuFile open
+# path covered.
+export KVIKIO_COMPAT_MODE="${KVIKIO_COMPAT_MODE:-ON}"
+
 # Run libcuvs gtests from libcuvs-tests package
 rapids-logger "Run libcuvs tests (shard ${SHARD} of ${NUM_SHARDS})"
 pushd "$CONDA_PREFIX"/bin/gtests/libcuvs
 timeout -v --signal=SIGINT --kill-after=60s 100m ctest -j8 --output-on-failure -I "${SHARD},,${NUM_SHARDS}"
+if [[ "${SHARD}" == "1" && "${KVIKIO_COMPAT_MODE}" == "ON" ]]; then
+  rapids-logger "Run libcuvs file I/O tests with KVIKIO_COMPAT_MODE=AUTO"
+  KVIKIO_COMPAT_MODE=AUTO ctest --output-on-failure -R '^UTIL_TEST$'
+fi
 popd
 
 rapids-logger "Test script exiting with value: $EXITCODE"
