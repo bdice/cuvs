@@ -19,12 +19,18 @@
 #include "naive_knn.cuh"
 
 #include "../test_utils.cuh"
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <limits>
+#include <set>
+#include <tuple>
+#include <type_traits>
+#include <vector>
 
 namespace cuvs::neighbors {
 
@@ -130,7 +136,25 @@ struct idx_dist_pair {
   idx_dist_pair(IdxT x, DistT y, CompareDist op) : idx(x), dist(y), eq_compare(op) {}
 };
 
+/**
+ * calc_recall scans expected rows of up to this many neighbors, which is faster for short rows.
+ * Longer rows are sorted once and searched: O(cols log cols) per row instead of O(cols^2).
+ */
+inline constexpr size_t recall_max_scan_cols = 64;
+
+/** Whether `idx` occurs in the expected row; `sorted_row` is the row in ascending order or null. */
+template <typename T>
+auto contains_index(const T* row, size_t cols, const std::vector<T>* sorted_row, T idx) -> bool
+{
+  if (sorted_row != nullptr) {
+    return std::binary_search(sorted_row->begin(), sorted_row->end(), idx);
+  }
+  return std::find(row, row + cols, idx) != row + cols;
+}
+
 /** Calculate recall value using only neighbor indices
+ *
+ * An actual neighbor is a match if its index occurs anywhere in the expected row.
  */
 template <typename T>
 auto calc_recall(const std::vector<T>& expected_idx,
@@ -138,19 +162,21 @@ auto calc_recall(const std::vector<T>& expected_idx,
                  size_t rows,
                  size_t cols)
 {
-  size_t match_count = 0;
-  size_t total_count = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  size_t match_count   = 0;
+  size_t total_count   = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  const bool sort_rows = cols > recall_max_scan_cols;
+  std::vector<T> exp_idx_sorted;
   for (size_t i = 0; i < rows; ++i) {
+    const T* exp_idx_row = expected_idx.data() + i * cols;  // row major assumption!
+    if (sort_rows) {
+      exp_idx_sorted.assign(exp_idx_row, exp_idx_row + cols);
+      std::sort(exp_idx_sorted.begin(), exp_idx_sorted.end());
+    }
     for (size_t k = 0; k < cols; ++k) {
       size_t idx_k = i * cols + k;  // row major assumption!
       auto act_idx = actual_idx[idx_k];
-      for (size_t j = 0; j < cols; ++j) {
-        size_t idx   = i * cols + j;  // row major assumption!
-        auto exp_idx = expected_idx[idx];
-        if (act_idx == exp_idx) {
-          match_count++;
-          break;
-        }
+      if (contains_index(exp_idx_row, cols, sort_rows ? &exp_idx_sorted : nullptr, act_idx)) {
+        match_count++;
       }
     }
   }
@@ -159,6 +185,10 @@ auto calc_recall(const std::vector<T>& expected_idx,
 }
 
 /** check uniqueness of indices
+ *
+ * Indices equal to std::numeric_limits<T>::max() (no neighbor) are ignored. Every repeated
+ * occurrence of an index within a row counts as one duplicate; the check fails at the occurrence
+ * that makes the total over all rows exceed `max_duplicates`.
  */
 template <typename T>
 auto check_unique_indices(const std::vector<T>& actual_idx,
@@ -166,26 +196,31 @@ auto check_unique_indices(const std::vector<T>& actual_idx,
                           size_t cols,
                           size_t max_duplicates = 0)
 {
-  size_t max_count;
   size_t dup_count = 0lu;
 
-  std::set<T> unique_indices;
+  std::vector<T> row_sorted;
   for (size_t i = 0; i < rows; ++i) {
-    unique_indices.clear();
-    max_count = 0;
+    const T* row = actual_idx.data() + i * cols;  // row major assumption!
+    row_sorted.assign(row, row + cols);
+    std::sort(row_sorted.begin(), row_sorted.end());
+    size_t row_dup_count = 0;
+    for (size_t k = 1; k < cols; ++k) {
+      if (row_sorted[k] == row_sorted[k - 1] && row_sorted[k] != std::numeric_limits<T>::max()) {
+        row_dup_count++;
+      }
+    }
+    if (dup_count + row_dup_count <= max_duplicates) {
+      dup_count += row_dup_count;
+      continue;
+    }
+    // This row exceeds the limit: walk it in order to report the first offending duplicate.
+    std::set<T> unique_indices;
     for (size_t k = 0; k < cols; ++k) {
-      size_t idx_k = i * cols + k;  // row major assumption!
-      auto act_idx = actual_idx[idx_k];
-      if (act_idx == std::numeric_limits<T>::max()) {
-        max_count++;
-      } else if (unique_indices.find(act_idx) == unique_indices.end()) {
-        unique_indices.insert(act_idx);
-      } else {
-        dup_count++;
-        if (dup_count > max_duplicates) {
-          return testing::AssertionFailure()
-                 << "Duplicated index " << act_idx << " at k " << k << " for query " << i << "! ";
-        }
+      auto act_idx = row[k];
+      if (act_idx == std::numeric_limits<T>::max()) { continue; }
+      if (!unique_indices.insert(act_idx).second && ++dup_count > max_duplicates) {
+        return testing::AssertionFailure()
+               << "Duplicated index " << act_idx << " at k " << k << " for query " << i << "! ";
       }
     }
   }
@@ -222,7 +257,60 @@ auto eval_recall(const std::vector<T>& expected_idx,
     return testing::AssertionSuccess();
 }
 
+/** Distance types for which calc_recall can look up distances in a sorted row. */
+template <typename DistT>
+inline constexpr bool sorted_distance_lookup =
+  std::is_same_v<DistT, float> || std::is_same_v<DistT, double>;
+
+/**
+ * Whether `eq_compare(e, dist)` holds for any distance `e` of the expected row.
+ *
+ * `sorted_row` holds the non-NaN distances of the row in ascending order (NaN never compares
+ * approximately equal), or is null to scan the row.
+ */
+template <typename DistT>
+auto has_approx_equal_distance(const DistT* row,
+                               size_t cols,
+                               const std::vector<DistT>* sorted_row,
+                               DistT dist,
+                               double eps,
+                               const cuvs::CompareApprox<DistT>& eq_compare) -> bool
+{
+  if constexpr (sorted_distance_lookup<DistT>) {
+    const double eps_t = static_cast<DistT>(eps);  // the eps that CompareApprox<DistT> uses
+    if (sorted_row != nullptr && eps_t >= 0.0 && eps_t <= 0.5) {
+      // For a finite eps, NaN and infinity never compare approximately equal to anything.
+      if (!std::isfinite(dist)) { return false; }
+      // eq_compare(e, dist) implies |e - dist| <= eps_t * max(1, |dist|) / ((1 - u)^2 - eps_t),
+      // where u is the unit roundoff of DistT. Since (1 - u)^2 > 1 - 2^-10, every match lies in
+      // [lo, hi]. Test the candidates in this window exactly, closest first.
+      const double d      = dist;
+      const double radius = eps_t * std::max(1.0, std::abs(d)) / (1.0 - 1.0 / 1024.0 - eps_t);
+      const double lo     = d - radius;
+      const double hi     = d + radius;
+      auto right          = std::lower_bound(sorted_row->begin(), sorted_row->end(), dist);
+      auto left           = right;
+      while (true) {
+        bool has_right = right != sorted_row->end() && *right <= hi;
+        bool has_left  = left != sorted_row->begin() && *(left - 1) >= lo;
+        if (has_right && (!has_left || *right - d <= d - *(left - 1))) {
+          if (eq_compare(*right++, dist)) { return true; }
+        } else if (has_left) {
+          if (eq_compare(*--left, dist)) { return true; }
+        } else {
+          return false;
+        }
+      }
+    }
+  }
+  return std::any_of(row, row + cols, [&](const DistT& e) { return eq_compare(e, dist); });
+}
+
 /** Overload of calc_recall to account for distances
+ *
+ * An actual neighbor is a match if its index occurs anywhere in the expected row, or if its
+ * distance is approximately equal (CompareApprox<DistT>(eps)) to any expected distance of the row.
+ * Returns {recall, index-only recall, match count, total count}.
  */
 template <typename T, typename DistT>
 auto calc_recall(const std::vector<T>& expected_idx,
@@ -236,38 +324,41 @@ auto calc_recall(const std::vector<T>& expected_idx,
   size_t match_count       = 0;
   size_t index_match_count = 0;
   size_t total_count       = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  cuvs::CompareApprox<DistT> eq_compare(eps);
+  const bool sort_rows      = cols > recall_max_scan_cols;
+  const bool sort_dist_rows = sort_rows && sorted_distance_lookup<DistT>;
+  std::vector<T> exp_idx_sorted;
+  std::vector<DistT> exp_dist_sorted;
   for (size_t i = 0; i < rows; ++i) {
+    const T* exp_idx_row      = expected_idx.data() + i * cols;  // row major assumption!
+    const DistT* exp_dist_row = expected_dist.data() + i * cols;
+    if (sort_rows) {
+      exp_idx_sorted.assign(exp_idx_row, exp_idx_row + cols);
+      std::sort(exp_idx_sorted.begin(), exp_idx_sorted.end());
+    }
+    if constexpr (sorted_distance_lookup<DistT>) {
+      if (sort_dist_rows) {
+        exp_dist_sorted.clear();
+        for (size_t j = 0; j < cols; ++j) {
+          if (!std::isnan(exp_dist_row[j])) { exp_dist_sorted.push_back(exp_dist_row[j]); }
+        }
+        std::sort(exp_dist_sorted.begin(), exp_dist_sorted.end());
+      }
+    }
     for (size_t k = 0; k < cols; ++k) {
       size_t idx_k  = i * cols + k;  // row major assumption!
       auto act_idx  = actual_idx[idx_k];
       auto act_dist = actual_dist[idx_k];
-      for (size_t j = 0; j < cols; ++j) {
-        size_t idx    = i * cols + j;  // row major assumption!
-        auto exp_idx  = expected_idx[idx];
-        auto exp_dist = expected_dist[idx];
-        idx_dist_pair exp_kvp(exp_idx, exp_dist, cuvs::CompareApprox<DistT>(eps));
-        idx_dist_pair act_kvp(act_idx, act_dist, cuvs::CompareApprox<DistT>(eps));
-        if (exp_kvp == act_kvp) {
-          match_count++;
-          break;
-        }
-      }
-    }
-  }
-
-  // Index based recall
-  for (size_t i = 0; i < rows; ++i) {
-    for (size_t k = 0; k < cols; ++k) {
-      size_t idx_k = i * cols + k;  // row major assumption!
-      auto act_idx = actual_idx[idx_k];
-      for (size_t j = 0; j < cols; ++j) {
-        size_t idx   = i * cols + j;  // row major assumption!
-        auto exp_idx = expected_idx[idx];
-
-        if (act_idx == exp_idx) {
-          index_match_count++;
-          break;
-        }
+      if (contains_index(exp_idx_row, cols, sort_rows ? &exp_idx_sorted : nullptr, act_idx)) {
+        match_count++;
+        index_match_count++;
+      } else if (has_approx_equal_distance(exp_dist_row,
+                                           cols,
+                                           sort_dist_rows ? &exp_dist_sorted : nullptr,
+                                           act_dist,
+                                           eps,
+                                           eq_compare)) {
+        match_count++;
       }
     }
   }
