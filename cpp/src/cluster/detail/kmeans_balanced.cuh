@@ -70,7 +70,10 @@ namespace cuvs::cluster::kmeans::detail {
  * @param[in] dataset_norm Pointer to the precomputed norm (for L2 metrics only) [n_rows]
  * @param[in] n_rows Number samples in the `dataset`
  * @param[out] labels Output predictions [n_rows]
- * @param[inout] mr (optional) Memory resource to use for temporary allocations
+ * @param[inout] L2NormBuf_OR_DistBuf Scratch buffer (centroid norms or the distance matrix);
+ *   resized as needed
+ * @param[inout] assignment_output Scratch buffer for the assignment result; resized as needed
+ * @param[inout] workspace Scratch buffer for the distance backend; resized as needed
  */
 template <typename MathT, typename IdxT, typename LabelT>
 inline std::enable_if_t<std::is_floating_point_v<MathT>> predict_core(
@@ -83,22 +86,19 @@ inline std::enable_if_t<std::is_floating_point_v<MathT>> predict_core(
   const MathT* dataset_norm,
   IdxT n_rows,
   LabelT* labels,
-  cuda::mr::device_resource_ref mr)
+  rmm::device_uvector<MathT>& L2NormBuf_OR_DistBuf,
+  rmm::device_uvector<char>& assignment_output,
+  rmm::device_uvector<char>& workspace)
 {
   auto stream = raft::resource::get_cuda_stream(handle);
   switch (params.metric) {
     case cuvs::distance::DistanceType::L2Expanded:
     case cuvs::distance::DistanceType::L2SqrtExpanded:
     case cuvs::distance::DistanceType::CosineExpanded: {
-      rmm::device_uvector<MathT> L2NormBuf_OR_DistBuf(0, stream, mr);
-      rmm::device_uvector<char> workspace(0, stream, mr);
-
       auto X_view = raft::make_device_matrix_view<const MathT, IdxT>(dataset, n_rows, dim);
       auto centroids_view =
         raft::make_device_matrix_view<const MathT, IdxT>(centers, n_clusters, dim);
       auto X_norm_view = raft::make_device_vector_view<const MathT, IdxT>(dataset_norm, n_rows);
-
-      rmm::device_uvector<char> assignment_output(0, stream, mr);
 
       const auto result = cuvs::cluster::kmeans::detail::minClusterAndDistanceCompute<MathT, IdxT>(
         handle,
@@ -116,8 +116,8 @@ inline std::enable_if_t<std::is_floating_point_v<MathT>> predict_core(
       break;
     }
     case cuvs::distance::DistanceType::InnerProduct: {
-      // TODO: pass buffer
-      rmm::device_uvector<MathT> distances(n_rows * n_clusters, stream, mr);
+      auto& distances = L2NormBuf_OR_DistBuf;
+      distances.resize(n_rows * n_clusters, stream);
 
       MathT alpha = -1.0;
       MathT beta  = 0.0;
@@ -236,6 +236,8 @@ auto calc_minibatch_size(const raft::resources& handle,
  *    the weighted average principle.
  * @param[in] mapping_op Mapping operation from T to MathT
  * @param[inout] mr (optional) Memory resource to use for temporary allocations on the device
+ * @param[inout] workspace Scratch buffer for the label histogram; resized as needed, so passing
+ *   the same buffer to repeated calls avoids reallocating it
  */
 template <typename T,
           typename MathT,
@@ -253,7 +255,8 @@ void calc_centers_and_sizes(const raft::resources& handle,
                             const LabelT* labels,
                             bool reset_counters,
                             MappingOpT mapping_op,
-                            cuda::mr::device_resource_ref mr)
+                            cuda::mr::device_resource_ref mr,
+                            rmm::device_uvector<char>& workspace)
 {
   auto stream = raft::resource::get_cuda_stream(handle);
 
@@ -264,8 +267,6 @@ void calc_centers_and_sizes(const raft::resources& handle,
     raft::linalg::matrix_vector_op<raft::Apply::ALONG_COLUMNS>(
       handle, raft::make_const_mdspan(centersView), clusterSizesView, centersView, raft::mul_op{});
   }
-
-  rmm::device_uvector<char> workspace(0, stream, mr);
 
   // If we reset the counters, we can compute directly the new sizes in cluster_sizes.
   // If we don't reset, we compute in a temporary buffer and add in a separate step.
@@ -321,6 +322,39 @@ void calc_centers_and_sizes(const raft::resources& handle,
                                                              clusterSizesView,
                                                              centersView,
                                                              raft::div_checkzero_op{});
+}
+
+template <typename T,
+          typename MathT,
+          typename IdxT,
+          typename LabelT,
+          typename CounterT,
+          typename MappingOpT>
+void calc_centers_and_sizes(const raft::resources& handle,
+                            MathT* centers,
+                            CounterT* cluster_sizes,
+                            IdxT n_clusters,
+                            IdxT dim,
+                            const T* dataset,
+                            IdxT n_rows,
+                            const LabelT* labels,
+                            bool reset_counters,
+                            MappingOpT mapping_op,
+                            cuda::mr::device_resource_ref mr)
+{
+  rmm::device_uvector<char> workspace(0, raft::resource::get_cuda_stream(handle), mr);
+  calc_centers_and_sizes(handle,
+                         centers,
+                         cluster_sizes,
+                         n_clusters,
+                         dim,
+                         dataset,
+                         n_rows,
+                         labels,
+                         reset_counters,
+                         mapping_op,
+                         mr,
+                         workspace);
 }
 
 /** Computes the L2 norm of the dataset, converting to MathT if necessary */
@@ -496,6 +530,201 @@ bool predict_core_half(const raft::resources& handle,
   return true;
 }
 
+/** Whether `predict` uses the row norms of the dataset for the given metric. */
+inline bool metric_uses_dataset_norm(cuvs::distance::DistanceType metric)
+{
+  return metric == cuvs::distance::DistanceType::L2Expanded ||
+         metric == cuvs::distance::DistanceType::L2SqrtExpanded ||
+         metric == cuvs::distance::DistanceType::CosineExpanded;
+}
+
+/**
+ * @brief Scratch buffers of `predict`.
+ *
+ * Passing the same instance to repeated `predict_with_workspace` calls of the same shape (e.g. the
+ * EM iterations of `balancing_em_iters`) allocates the buffers once instead of on every call.
+ */
+template <typename MathT>
+struct predict_workspace {
+  predict_workspace(cuda::stream_ref stream, cuda::mr::device_resource_ref mr)
+    : mr(mr),
+      cur_dataset(0, stream, mr),
+      cur_dataset_norm(0, stream, mr),
+      norm_or_dist(0, stream, mr),
+      assignment_output(0, stream, mr),
+      workspace(0, stream, mr)
+  {
+  }
+
+  cuda::mr::device_resource_ref mr;
+  /** A minibatch converted to MathT (only used when T != MathT) [max_minibatch_size * dim] */
+  rmm::device_uvector<MathT> cur_dataset;
+  /** Row norms of a minibatch [max_minibatch_size] */
+  rmm::device_uvector<MathT> cur_dataset_norm;
+  /** Scratch buffers of `predict_core` */
+  rmm::device_uvector<MathT> norm_or_dist;
+  rmm::device_uvector<char> assignment_output;
+  rmm::device_uvector<char> workspace;
+  /** Scratch buffers of `predict_core_half` (only used when T == half and MathT == float) */
+  std::optional<predict_core_half_workspace> native_half;
+};
+
+/**
+ * @brief Get the rows [offset, offset + minibatch_size) of the dataset as MathT.
+ *
+ * @return `dataset + offset * dim` if T == MathT; otherwise `buf`, into which the rows are mapped.
+ */
+template <typename T, typename MathT, typename IdxT, typename MappingOpT>
+auto map_minibatch(const raft::resources& handle,
+                   const T* dataset,
+                   IdxT offset,
+                   IdxT minibatch_size,
+                   IdxT dim,
+                   MappingOpT mapping_op,
+                   MathT* buf) -> const MathT*
+{
+  if constexpr (std::is_same_v<T, MathT>) {
+    return dataset + offset * dim;
+  } else {
+    raft::linalg::map(
+      handle,
+      raft::make_device_vector_view<const T, IdxT>(dataset + offset * dim, minibatch_size * dim),
+      raft::make_device_vector_view<MathT, IdxT>(buf, minibatch_size * dim),
+      mapping_op);
+    return buf;
+  }
+}
+
+/** Computes the row norms of a minibatch (already in MathT) as needed by `predict_core`. */
+template <typename MathT, typename IdxT, typename MappingOpT>
+void compute_minibatch_norm(const raft::resources& handle,
+                            cuvs::distance::DistanceType metric,
+                            MathT* minibatch_norm,
+                            const MathT* minibatch,
+                            IdxT dim,
+                            IdxT minibatch_size,
+                            MappingOpT mapping_op,
+                            cuda::mr::device_resource_ref mr)
+{
+  if (metric == cuvs::distance::DistanceType::CosineExpanded) {
+    compute_norm(
+      handle, minibatch_norm, minibatch, dim, minibatch_size, mapping_op, raft::sqrt_op{}, mr);
+  } else {
+    compute_norm(
+      handle, minibatch_norm, minibatch, dim, minibatch_size, mapping_op, raft::identity_op{}, mr);
+  }
+}
+
+/**
+ * @brief Predict labels for the dataset, processing it in minibatches of a given size and using
+ * caller-provided scratch buffers.
+ *
+ * @tparam T element type
+ * @tparam MathT type of the centroids and mapped data
+ * @tparam IdxT index type
+ * @tparam LabelT label type
+ * @tparam MappingOpT type of the mapping operation
+ *
+ * @param[in] handle The raft handle
+ * @param[in] params Structure containing the hyper-parameters
+ * @param[in] centers Pointer to the row-major matrix of cluster centers [n_clusters, dim]
+ * @param[in] n_clusters Number of clusters/centers
+ * @param[in] dim Dimensionality of the data
+ * @param[in] dataset Pointer to the data [n_rows, dim]
+ * @param[in] n_rows Number samples in the `dataset`
+ * @param[out] labels Output predictions [n_rows]
+ * @param[in] mapping_op Mapping operation from T to MathT
+ * @param[in] dataset_norm (optional) Pre-computed norms of each row in the dataset [n_rows]
+ * @param[in] max_minibatch_size Number of rows processed at once (see `calc_minibatch_size`)
+ * @param[inout] ws Scratch buffers; resized as needed
+ */
+template <typename T, typename MathT, typename IdxT, typename LabelT, typename MappingOpT>
+void predict_with_workspace(const raft::resources& handle,
+                            const cuvs::cluster::kmeans::balanced_params& params,
+                            const MathT* centers,
+                            IdxT n_clusters,
+                            IdxT dim,
+                            const T* dataset,
+                            IdxT n_rows,
+                            LabelT* labels,
+                            MappingOpT mapping_op,
+                            const MathT* dataset_norm,
+                            IdxT max_minibatch_size,
+                            predict_workspace<MathT>& ws)
+{
+  auto stream = raft::resource::get_cuda_stream(handle);
+  raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
+    "predict(%zu, %u)", static_cast<size_t>(n_rows), n_clusters);
+  constexpr bool native_half   = std::is_same_v<T, half> && std::is_same_v<MathT, float>;
+  const bool need_compute_norm = dataset_norm == nullptr && metric_uses_dataset_norm(params.metric);
+  if constexpr (!std::is_same_v<T, MathT>) {
+    ws.cur_dataset.resize(static_cast<std::size_t>(max_minibatch_size) * dim, stream);
+  }
+  if (need_compute_norm || native_half) { ws.cur_dataset_norm.resize(max_minibatch_size, stream); }
+  if constexpr (native_half) {
+    const auto native_centers_size =
+      static_cast<std::size_t>(n_clusters) * static_cast<std::size_t>(dim);
+    if (!ws.native_half.has_value() || ws.native_half->centers.size() != native_centers_size ||
+        ws.native_half->centers_norm.size() != static_cast<std::size_t>(n_clusters) ||
+        ws.native_half->distances.size() < static_cast<std::size_t>(max_minibatch_size)) {
+      ws.native_half.emplace(native_centers_size, n_clusters, max_minibatch_size, stream, ws.mr);
+    }
+    // The converted centers are only valid for the minibatches of this call.
+    ws.native_half->centers_ready = false;
+  }
+  const MathT* dataset_norm_ptr = nullptr;
+  for (IdxT offset = 0; offset < n_rows; offset += max_minibatch_size) {
+    IdxT minibatch_size = std::min<IdxT>(max_minibatch_size, n_rows - offset);
+
+    if constexpr (native_half) {
+      if (predict_core_half(handle,
+                            params,
+                            centers,
+                            n_clusters,
+                            dim,
+                            dataset + static_cast<std::size_t>(offset) * dim,
+                            minibatch_size,
+                            labels + offset,
+                            mapping_op,
+                            ws.cur_dataset_norm.data(),
+                            *ws.native_half,
+                            ws.mr)) {
+        continue;
+      }
+    }
+    const MathT* cur_dataset_ptr = map_minibatch(
+      handle, dataset, offset, minibatch_size, dim, mapping_op, ws.cur_dataset.data());
+
+    // Compute the norm now if it hasn't been pre-computed.
+    if (need_compute_norm) {
+      compute_minibatch_norm(handle,
+                             params.metric,
+                             ws.cur_dataset_norm.data(),
+                             cur_dataset_ptr,
+                             dim,
+                             minibatch_size,
+                             mapping_op,
+                             ws.mr);
+      dataset_norm_ptr = ws.cur_dataset_norm.data();
+    } else if (dataset_norm != nullptr) {
+      dataset_norm_ptr = dataset_norm + offset;
+    }
+
+    predict_core(handle,
+                 params,
+                 centers,
+                 n_clusters,
+                 dim,
+                 cur_dataset_ptr,
+                 dataset_norm_ptr,
+                 minibatch_size,
+                 labels + offset,
+                 ws.norm_or_dist,
+                 ws.assignment_output,
+                 ws.workspace);
+  }
+}
+
 /**
  * @brief Predict labels for the dataset.
  *
@@ -530,97 +759,36 @@ void predict(const raft::resources& handle,
              std::optional<cuda::mr::device_resource_ref> mr = std::nullopt,
              const MathT* dataset_norm                       = nullptr)
 {
-  auto stream = raft::resource::get_cuda_stream(handle);
-  raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
-    "predict(%zu, %u)", static_cast<size_t>(n_rows), n_clusters);
-  auto mem_res = mr.value_or(raft::resource::get_workspace_resource_ref(handle));
-  auto [max_minibatch_size, _mem_per_row] = calc_minibatch_size<MathT>(
-    handle, n_clusters, n_rows, dim, params.metric, std::is_same_v<T, MathT>);
-  rmm::device_uvector<MathT> cur_dataset(
-    std::is_same_v<T, MathT> ? 0 : max_minibatch_size * dim, stream, mem_res);
-  constexpr bool native_half = std::is_same_v<T, half> && std::is_same_v<MathT, float>;
-  bool need_compute_norm =
-    dataset_norm == nullptr && (params.metric == cuvs::distance::DistanceType::L2Expanded ||
-                                params.metric == cuvs::distance::DistanceType::L2SqrtExpanded ||
-                                params.metric == cuvs::distance::DistanceType::CosineExpanded);
-  rmm::device_uvector<MathT> cur_dataset_norm(
-    need_compute_norm || native_half ? max_minibatch_size : 0, stream, mem_res);
-  const auto native_centers_size =
-    native_half ? static_cast<std::size_t>(n_clusters) * static_cast<std::size_t>(dim) : 0;
-  std::optional<predict_core_half_workspace> native_half_scratch;
-  if constexpr (native_half) {
-    native_half_scratch.emplace(
-      native_centers_size, n_clusters, max_minibatch_size, stream, mem_res);
-  }
-  const MathT* dataset_norm_ptr = nullptr;
-  auto cur_dataset_ptr          = cur_dataset.data();
-  for (IdxT offset = 0; offset < n_rows; offset += max_minibatch_size) {
-    IdxT minibatch_size = std::min<IdxT>(max_minibatch_size, n_rows - offset);
-
-    if constexpr (native_half) {
-      if (predict_core_half(handle,
-                            params,
-                            centers,
-                            n_clusters,
-                            dim,
-                            dataset + static_cast<std::size_t>(offset) * dim,
-                            minibatch_size,
-                            labels + offset,
-                            mapping_op,
-                            cur_dataset_norm.data(),
-                            *native_half_scratch,
-                            mr)) {
-        continue;
-      }
-    }
-    if constexpr (std::is_same_v<T, MathT>) {
-      cur_dataset_ptr = const_cast<MathT*>(dataset + offset * dim);
-    } else {
-      raft::linalg::map(
-        handle,
-        raft::make_device_vector_view<const T, IdxT>(dataset + offset * dim, minibatch_size * dim),
-        raft::make_device_vector_view<MathT, IdxT>(cur_dataset_ptr, minibatch_size * dim),
-        mapping_op);
-    }
-
-    // Compute the norm now if it hasn't been pre-computed.
-    if (need_compute_norm) {
-      if (params.metric == cuvs::distance::DistanceType::CosineExpanded)
-        compute_norm(handle,
-                     cur_dataset_norm.data(),
-                     cur_dataset_ptr,
-                     dim,
-                     minibatch_size,
-                     mapping_op,
-                     raft::sqrt_op{},
-                     mr);
-      else
-        compute_norm(handle,
-                     cur_dataset_norm.data(),
-                     cur_dataset_ptr,
-                     dim,
-                     minibatch_size,
-                     mapping_op,
-                     raft::identity_op{},
-                     mr);
-      dataset_norm_ptr = cur_dataset_norm.data();
-    } else if (dataset_norm != nullptr) {
-      dataset_norm_ptr = dataset_norm + offset;
-    }
-
-    predict_core(handle,
-                 params,
-                 centers,
-                 n_clusters,
-                 dim,
-                 cur_dataset_ptr,
-                 dataset_norm_ptr,
-                 minibatch_size,
-                 labels + offset,
-                 mem_res);
-  }
+  auto mem_res                  = mr.value_or(raft::resource::get_workspace_resource_ref(handle));
+  const IdxT max_minibatch_size = std::get<0>(calc_minibatch_size<MathT>(
+    handle, n_clusters, n_rows, dim, params.metric, std::is_same_v<T, MathT>));
+  predict_workspace<MathT> ws(raft::resource::get_cuda_stream(handle), mem_res);
+  predict_with_workspace(handle,
+                         params,
+                         centers,
+                         n_clusters,
+                         dim,
+                         dataset,
+                         n_rows,
+                         labels,
+                         mapping_op,
+                         dataset_norm,
+                         max_minibatch_size,
+                         ws);
 }
 
+/**
+ * Size of the per-call record of `adjust_centers_random`:
+ * [search_count, update_count, any_unbalanced].
+ */
+constexpr uint32_t kRandomDonorRecordSize = 3;
+
+/**
+ * Reinitializes each underfull cluster from a random data point whose cluster has at least the
+ * average size. `records` holds one zero-initialized record per call, see
+ * `kRandomDonorRecordSize`; this call fills `records[call]`. The donor search is seeded with
+ * `seeds[n]`, where n is the number of earlier calls that saw an unbalanced cluster.
+ */
 template <uint32_t BlockDimY,
           typename T,
           typename MathT,
@@ -637,22 +805,37 @@ __launch_bounds__((raft::WarpSize * BlockDimY)) RAFT_KERNEL
                                      const LabelT* labels,           // [n_rows]
                                      const CounterT* cluster_sizes,  // [n_clusters]
                                      MathT lower_threshold,
+                                     MathT upper_threshold,
                                      IdxT average,
                                      MathT centroid_offset,
-                                     IdxT seed,
-                                     IdxT* search_count,
-                                     IdxT* update_count,
+                                     const IdxT* seeds,
+                                     IdxT* records,
+                                     uint32_t call,
                                      MappingOpT mapping_op)
 {
   IdxT receiver_cluster = threadIdx.y + BlockDimY * static_cast<IdxT>(blockIdx.x);
   if (receiver_cluster >= n_clusters) return;
-  auto receiver_size = static_cast<IdxT>(cluster_sizes[receiver_cluster]);
-  if (static_cast<MathT>(receiver_size) >= lower_threshold) return;
+  IdxT* search_count   = records + kRandomDonorRecordSize * call;
+  IdxT* update_count   = search_count + 1;
+  IdxT* any_unbalanced = search_count + 2;
+  auto receiver_size   = static_cast<IdxT>(cluster_sizes[receiver_cluster]);
+  const bool underfull = !(static_cast<MathT>(receiver_size) >= lower_threshold);
+  // Record whether any cluster is underfull or overfull; all writers store the same value.
+  if (raft::laneId() == 0 &&
+      (underfull || !(static_cast<MathT>(receiver_size) <= upper_threshold))) {
+    *any_unbalanced = 1;
+  }
+  if (!underfull) return;
 
   IdxT i = n_rows;
   IdxT j = raft::laneId();
   if (j == 0) {
-    IdxT attempt = 0;
+    IdxT n_used_seeds = 0;
+    for (uint32_t prev_call = 0; prev_call < call; prev_call++) {
+      if (records[kRandomDonorRecordSize * prev_call + 2] != 0) { n_used_seeds++; }
+    }
+    const IdxT seed = seeds[n_used_seeds];
+    IdxT attempt    = 0;
     do {
       auto old = atomicAdd(search_count, IdxT{1});
       auto candidate =
@@ -730,17 +913,47 @@ __launch_bounds__((raft::WarpSize * BlockDimY)) RAFT_KERNEL
 }
 
 /**
- * @brief Adjust centers for clusters that have small number of entries.
+ * @brief Advances `i_primes` to the next prime that seeds the donor point search, and returns the
+ * prime. Primes that divide `n_rows` (which must be positive) are skipped.
+ */
+template <typename IdxT>
+auto next_donor_seed(IdxT& i_primes, IdxT n_rows) -> IdxT
+{
+  constexpr static std::array kPrimes{29,   71,   113,  173,  229,  281,  349,  409,  463,  541,
+                                      601,  659,  733,  809,  863,  941,  1013, 1069, 1151, 1223,
+                                      1291, 1373, 1451, 1511, 1583, 1657, 1733, 1811, 1889, 1987,
+                                      2053, 2129, 2213, 2287, 2357, 2423, 2531, 2617, 2687, 2741};
+  IdxT ofst;
+  do {
+    i_primes = (i_primes + 1) % kPrimes.size();
+    ofst     = kPrimes[i_primes];
+  } while (n_rows % ofst == 0);
+  return ofst;
+}
+
+/**
+ * @brief The process-wide position in the prime table of `next_donor_seed`; one per instantiation
+ * of the balancing step, advanced every time the balancing step finds an unbalanced cluster.
+ */
+template <typename T,
+          typename MathT,
+          typename IdxT,
+          typename LabelT,
+          typename CounterT,
+          typename MappingOpT>
+auto donor_seed_state() -> IdxT&
+{
+  static IdxT i_primes = 0;
+  return i_primes;
+}
+
+/**
+ * @brief Adjust centers for clusters that have small number of entries (SizeSorted donor
+ * selection).
  *
- * With SizeSorted donor selection, cluster sizes are sorted, then the smallest clusters are paired
- * with the largest clusters. For each pair where the small cluster is underfull or the large
- * cluster is overfull, the small cluster center is moved towards a data point from the large
- * cluster.
- *
- * With Random donor selection, underfull clusters are reinitialized from random data points whose
- * current cluster size is at least the average cluster size. This matches the historical
- * rebalancing behavior used by IVF-PQ, but the upper balance threshold does not control donor
- * selection in this mode.
+ * Cluster sizes are sorted, then the smallest clusters are paired with the largest clusters. For
+ * each pair where the small cluster is underfull or the large cluster is overfull, the small
+ * cluster center is moved towards a data point from the large cluster.
  *
  * NB: if this function returns `true`, you should update the labels.
  *
@@ -769,7 +982,8 @@ __launch_bounds__((raft::WarpSize * BlockDimY)) RAFT_KERNEL
  *                   balance_upper_tolerance > 1
  * @param[in] centroid_offset offset from the donor cluster centroid towards a donor point
  * @param[in] mapping_op Mapping operation from T to MathT
- * @param[inout] device_memory  memory resource to use for temporary allocations
+ * @param[inout] workspace device scratch buffer; resized as needed, so passing the same buffer to
+ *   repeated calls avoids reallocating it
  *
  * @return whether any of the centers has been updated (and thus, `labels` need to be recalculated).
  */
@@ -790,19 +1004,13 @@ auto adjust_centers(const raft::resources& handle,
                     MathT balance_lower_tolerance,
                     MathT balance_upper_tolerance,
                     MathT centroid_offset,
-                    cuvs::cluster::kmeans::balanced_donor_selection donor_selection,
                     MappingOpT mapping_op,
-                    cuda::mr::device_resource_ref device_memory) -> bool
+                    rmm::device_uvector<IdxT>& workspace) -> bool
 {
   raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
     "adjust_centers(%zu, %u)", static_cast<size_t>(n_rows), n_clusters);
   if (n_clusters == 0) { return false; }
   auto stream = raft::resource::get_cuda_stream(handle);
-  constexpr static std::array kPrimes{29,   71,   113,  173,  229,  281,  349,  409,  463,  541,
-                                      601,  659,  733,  809,  863,  941,  1013, 1069, 1151, 1223,
-                                      1291, 1373, 1451, 1511, 1583, 1657, 1733, 1811, 1889, 1987,
-                                      2053, 2129, 2213, 2287, 2357, 2423, 2531, 2617, 2687, 2741};
-  static IdxT i_primes = 0;
 
   auto average         = static_cast<MathT>(n_rows) / static_cast<MathT>(n_clusters);
   auto lower_threshold = average * balance_lower_tolerance;
@@ -837,60 +1045,116 @@ auto adjust_centers(const raft::resources& handle,
   auto n_pairs = static_cast<IdxT>(host_receiver_clusters.size());
   if (n_pairs == 0) { return false; }
 
-  IdxT ofst;
-  do {
-    i_primes = (i_primes + 1) % kPrimes.size();
-    ofst     = kPrimes[i_primes];
-  } while (n_rows % ofst == 0);
+  const IdxT ofst =
+    next_donor_seed(donor_seed_state<T, MathT, IdxT, LabelT, CounterT, MappingOpT>(), n_rows);
 
-  rmm::device_uvector<IdxT> receiver_clusters(n_pairs, stream, device_memory);
-  rmm::device_uvector<IdxT> donor_clusters(n_pairs, stream, device_memory);
+  // [update_count, receiver_clusters[n_pairs], donor_clusters[n_pairs]]
+  const auto workspace_size = 1 + 2 * static_cast<std::size_t>(n_pairs);
+  if (workspace.size() < workspace_size) { workspace.resize(workspace_size, stream); }
+  IdxT* update_count      = workspace.data();
+  IdxT* receiver_clusters = update_count + 1;
+  IdxT* donor_clusters    = receiver_clusters + n_pairs;
+  RAFT_CUDA_TRY(cudaMemsetAsync(update_count, 0, sizeof(IdxT), stream.get()));
+  raft::update_device(receiver_clusters, host_receiver_clusters.data(), n_pairs, stream);
+  raft::update_device(donor_clusters, host_donor_clusters.data(), n_pairs, stream);
   constexpr uint32_t kBlockDimY = 4;
   const dim3 block_dim(raft::WarpSize, kBlockDimY, 1);
-  rmm::device_scalar<IdxT> update_count(stream, device_memory);
-  update_count.set_value_to_zero_async(stream);
-
-  if (donor_selection == cuvs::cluster::kmeans::balanced_donor_selection::Random) {
-    rmm::device_scalar<IdxT> search_count(stream, device_memory);
-    search_count.set_value_to_zero_async(stream);
-    const dim3 grid_dim(raft::ceildiv(n_clusters, static_cast<IdxT>(kBlockDimY)), 1, 1);
-    adjust_centers_random_donor_kernel<kBlockDimY>
-      <<<grid_dim, block_dim, 0, stream.get()>>>(centers,
-                                                 n_clusters,
-                                                 dim,
-                                                 dataset,
-                                                 n_rows,
-                                                 labels,
-                                                 cluster_sizes,
-                                                 lower_threshold,
-                                                 static_cast<IdxT>(n_rows / n_clusters),
-                                                 centroid_offset,
-                                                 ofst,
-                                                 search_count.data(),
-                                                 update_count.data(),
-                                                 mapping_op);
-    return update_count.value(stream) > 0;  // NB: rmm scalar performs the sync
-  }
-
-  raft::update_device(receiver_clusters.data(), host_receiver_clusters.data(), n_pairs, stream);
-  raft::update_device(donor_clusters.data(), host_donor_clusters.data(), n_pairs, stream);
   const dim3 grid_dim(raft::ceildiv(n_pairs, static_cast<IdxT>(kBlockDimY)), 1, 1);
-  adjust_centers_kernel<kBlockDimY>
+  adjust_centers_kernel<kBlockDimY><<<grid_dim, block_dim, 0, stream.get()>>>(centers,
+                                                                              n_pairs,
+                                                                              dim,
+                                                                              dataset,
+                                                                              n_rows,
+                                                                              labels,
+                                                                              receiver_clusters,
+                                                                              donor_clusters,
+                                                                              centroid_offset,
+                                                                              ofst,
+                                                                              update_count,
+                                                                              mapping_op);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  IdxT n_updates = 0;
+  raft::update_host(&n_updates, update_count, 1, stream);
+  raft::resource::sync_stream(handle, stream);
+  RAFT_EXPECTS(n_updates == n_pairs, "Balanced k-means failed to update all adjusted centers");
+  return n_updates > 0;
+}
+
+/**
+ * @brief Adjust centers for clusters that have small number of entries (Random donor selection),
+ * without synchronizing the stream.
+ *
+ * Underfull clusters are reinitialized from random data points whose current cluster size is at
+ * least the average cluster size. This matches the historical rebalancing behavior used by IVF-PQ,
+ * but the upper balance threshold does not control donor selection in this mode.
+ *
+ * Instead of returning whether any center has been updated, the kernel writes the outcome to
+ * `records[call]` (see `kRandomDonorRecordSize`), which the caller reads back when it needs it.
+ *
+ * The seed of the donor search is `seeds[n]`, where n is the number of earlier calls that saw an
+ * underfull or overfull cluster. These are the calls in which the size-sorted pairing of
+ * `adjust_centers` finds a pair (given n_rows > 0, the cluster sizes are the histogram of the
+ * labels, so the largest cluster is not empty), i.e. in which the prime index is advanced. Only
+ * underfull clusters are changed, so the other calls change nothing. Hence, if `seeds[k]` is the
+ * result of the (k + 1)-th `next_donor_seed` call, the seeds and centers are the same as when the
+ * clusters are paired on the host before each call.
+ *
+ * @param[in] seeds the seeds of the calls that see an unbalanced cluster, in order
+ * @param[inout] records zero-initialized per-call records [kRandomDonorRecordSize * n_calls]
+ * @param[in] call index of this call in `records`
+ */
+template <typename T,
+          typename MathT,
+          typename IdxT,
+          typename LabelT,
+          typename CounterT,
+          typename MappingOpT>
+void adjust_centers_random(const raft::resources& handle,
+                           MathT* centers,
+                           IdxT n_clusters,
+                           IdxT dim,
+                           const T* dataset,
+                           IdxT n_rows,
+                           const LabelT* labels,
+                           const CounterT* cluster_sizes,
+                           MathT balance_lower_tolerance,
+                           MathT balance_upper_tolerance,
+                           MathT centroid_offset,
+                           MappingOpT mapping_op,
+                           const IdxT* seeds,
+                           IdxT* records,
+                           uint32_t call)
+{
+  raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
+    "adjust_centers_random(%zu, %u)", static_cast<size_t>(n_rows), n_clusters);
+  // With fewer than two clusters, or no rows, the size-sorted pairing finds no pair.
+  if (n_clusters < 2 || n_rows == 0) { return; }
+  auto stream = raft::resource::get_cuda_stream(handle);
+
+  auto average         = static_cast<MathT>(n_rows) / static_cast<MathT>(n_clusters);
+  auto lower_threshold = average * balance_lower_tolerance;
+  auto upper_threshold = average * balance_upper_tolerance;
+
+  constexpr uint32_t kBlockDimY = 4;
+  const dim3 block_dim(raft::WarpSize, kBlockDimY, 1);
+  const dim3 grid_dim(raft::ceildiv(n_clusters, static_cast<IdxT>(kBlockDimY)), 1, 1);
+  adjust_centers_random_donor_kernel<kBlockDimY>
     <<<grid_dim, block_dim, 0, stream.get()>>>(centers,
-                                               n_pairs,
+                                               n_clusters,
                                                dim,
                                                dataset,
                                                n_rows,
                                                labels,
-                                               receiver_clusters.data(),
-                                               donor_clusters.data(),
+                                               cluster_sizes,
+                                               lower_threshold,
+                                               upper_threshold,
+                                               static_cast<IdxT>(n_rows / n_clusters),
                                                centroid_offset,
-                                               ofst,
-                                               update_count.data(),
+                                               seeds,
+                                               records,
+                                               call,
                                                mapping_op);
-  auto n_updates = update_count.value(stream);  // NB: rmm scalar performs the sync
-  RAFT_EXPECTS(n_updates == n_pairs, "Balanced k-means failed to update all adjusted centers");
-  return n_updates > 0;
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 /**
@@ -963,27 +1227,113 @@ void balancing_em_iters(const raft::resources& handle,
   RAFT_EXPECTS(params.centroid_offset > 0.0f && params.centroid_offset <= 1.0f,
                "Balanced k-means centroid offset must be in the range (0, 1]");
 
+  auto stream = raft::resource::get_cuda_stream(handle);
+  // The scratch buffers below are allocated once and reused by all iterations. The minibatch size
+  // is computed before allocating them so that it does not depend on them: it is the size `predict`
+  // computes by itself on every iteration.
+  const IdxT max_minibatch_size = std::get<0>(calc_minibatch_size<MathT>(
+    handle, n_clusters, n_rows, dim, params.metric, std::is_same_v<T, MathT>));
+  predict_workspace<MathT> predict_ws(stream, device_memory);
+  rmm::device_uvector<char> centers_ws(0, stream, device_memory);
+  const bool random_donor =
+    params.donor_selection == cuvs::cluster::kmeans::balanced_donor_selection::Random;
+  rmm::device_uvector<IdxT> adjust_ws(
+    random_donor ? 0 : 1 + 2 * static_cast<std::size_t>(n_clusters / 2), stream, device_memory);
+
+  // With the Random donor selection, the balancing steps do not synchronize the stream: their
+  // outcomes are recorded on the device (see `adjust_centers_random`) and accounted for, in order,
+  // only when the loop is about to end, which is the only point where they matter (they may add
+  // iterations). This yields the same iterations, centers and prime index as accounting for them
+  // after each step.
+  const bool random_donor_active = random_donor && n_clusters >= 2 && n_rows > 0;
+  auto& i_primes                 = donor_seed_state<T, MathT, IdxT, LabelT, CounterT, MappingOpT>();
+  IdxT seeds_i_primes            = i_primes;
+  std::vector<IdxT> host_seeds;  // host_seeds[k]: the seed after k + 1 advances of `i_primes`
+  rmm::device_uvector<IdxT> seeds(0, stream, device_memory);
+  rmm::device_uvector<IdxT> records(0, stream, device_memory);
+  // Makes room for the balancing steps of the iterations [0, n): at most n seeds and n records.
+  auto reserve_random_donor_state = [&](uint32_t n) {
+    if (host_seeds.size() < n) {
+      while (host_seeds.size() < n) {
+        host_seeds.push_back(next_donor_seed(seeds_i_primes, n_rows));
+      }
+      seeds.resize(n, stream);
+      raft::update_device(seeds.data(), host_seeds.data(), n, stream);
+    }
+    const auto n_records = kRandomDonorRecordSize * static_cast<std::size_t>(n);
+    if (records.size() < n_records) {
+      const auto old_size = records.size();
+      records.resize(n_records, stream);
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        records.data() + old_size, 0, (n_records - old_size) * sizeof(IdxT), stream.get()));
+    }
+  };
+  if (random_donor_active) { reserve_random_donor_state(n_iters); }
+
+  // The dataset does not change across iterations, so neither do its norms. If `predict` would
+  // compute them in a single minibatch, compute them once here with the same call instead.
+  // (`predict_core_half` always computes its own norms.)
+  rmm::device_uvector<MathT> dataset_norm_buf(0, stream, device_memory);
+  if constexpr (!(std::is_same_v<T, half> && std::is_same_v<MathT, float>)) {
+    if (dataset_norm == nullptr && metric_uses_dataset_norm(params.metric) && n_rows > 0 &&
+        n_rows <= max_minibatch_size) {
+      if constexpr (!std::is_same_v<T, MathT>) {
+        predict_ws.cur_dataset.resize(static_cast<std::size_t>(max_minibatch_size) * dim, stream);
+      }
+      dataset_norm_buf.resize(n_rows, stream);
+      const MathT* mapped_dataset = map_minibatch(
+        handle, dataset, IdxT{0}, n_rows, dim, mapping_op, predict_ws.cur_dataset.data());
+      compute_minibatch_norm(handle,
+                             params.metric,
+                             dataset_norm_buf.data(),
+                             mapped_dataset,
+                             dim,
+                             n_rows,
+                             mapping_op,
+                             device_memory);
+      dataset_norm = dataset_norm_buf.data();
+    }
+  }
+
   uint32_t balancing_counter = balancing_pullback;
+  uint32_t n_accounted_iters = 1;  // Random donor: iterations whose balancing step is accounted for
   for (uint32_t iter = 0; iter < n_iters; iter++) {
     // Balancing step - move the centers around to equalize cluster sizes
     // (but not on the first iteration)
-    if (iter > 0 && adjust_centers(handle,
-                                   cluster_centers,
-                                   n_clusters,
-                                   dim,
-                                   dataset,
-                                   n_rows,
-                                   cluster_labels,
-                                   cluster_sizes,
-                                   balance_lower_tolerance,
-                                   balance_upper_tolerance,
-                                   static_cast<MathT>(params.centroid_offset),
-                                   params.donor_selection,
-                                   mapping_op,
-                                   device_memory)) {
-      if (balancing_counter++ >= balancing_pullback) {
-        balancing_counter -= balancing_pullback;
-        n_iters++;
+    if (iter > 0) {
+      if (random_donor) {
+        adjust_centers_random(handle,
+                              cluster_centers,
+                              n_clusters,
+                              dim,
+                              dataset,
+                              n_rows,
+                              cluster_labels,
+                              cluster_sizes,
+                              balance_lower_tolerance,
+                              balance_upper_tolerance,
+                              static_cast<MathT>(params.centroid_offset),
+                              mapping_op,
+                              seeds.data(),
+                              records.data(),
+                              iter);
+      } else if (adjust_centers(handle,
+                                cluster_centers,
+                                n_clusters,
+                                dim,
+                                dataset,
+                                n_rows,
+                                cluster_labels,
+                                cluster_sizes,
+                                balance_lower_tolerance,
+                                balance_upper_tolerance,
+                                static_cast<MathT>(params.centroid_offset),
+                                mapping_op,
+                                adjust_ws)) {
+        if (balancing_counter++ >= balancing_pullback) {
+          balancing_counter -= balancing_pullback;
+          n_iters++;
+        }
       }
     }
     switch (params.metric) {
@@ -1003,17 +1353,18 @@ void balancing_em_iters(const raft::resources& handle,
       default: break;
     }
     // E: Expectation step - predict labels
-    predict(handle,
-            params,
-            cluster_centers,
-            n_clusters,
-            dim,
-            dataset,
-            n_rows,
-            cluster_labels,
-            mapping_op,
-            device_memory,
-            dataset_norm);
+    predict_with_workspace(handle,
+                           params,
+                           cluster_centers,
+                           n_clusters,
+                           dim,
+                           dataset,
+                           n_rows,
+                           cluster_labels,
+                           mapping_op,
+                           dataset_norm,
+                           max_minibatch_size,
+                           predict_ws);
     // M: Maximization step - calculate optimal cluster centers
     calc_centers_and_sizes(handle,
                            cluster_centers,
@@ -1025,7 +1376,30 @@ void balancing_em_iters(const raft::resources& handle,
                            cluster_labels,
                            true,
                            mapping_op,
-                           device_memory);
+                           device_memory,
+                           centers_ws);
+
+    // Random donor: before the loop ends, account for the pending balancing steps in order.
+    if (random_donor_active && iter + 1 == n_iters && n_accounted_iters < n_iters) {
+      const uint32_t n_pending = n_iters - n_accounted_iters;
+      std::vector<IdxT> host_records(kRandomDonorRecordSize * static_cast<std::size_t>(n_pending));
+      raft::update_host(host_records.data(),
+                        records.data() + kRandomDonorRecordSize * n_accounted_iters,
+                        host_records.size(),
+                        stream);
+      raft::resource::sync_stream(handle, stream);
+      n_accounted_iters = n_iters;
+      for (uint32_t k = 0; k < n_pending; k++) {
+        const IdxT* record = host_records.data() + kRandomDonorRecordSize * k;
+        // [search_count, update_count, any_unbalanced]
+        if (record[2] != 0) { next_donor_seed(i_primes, n_rows); }
+        if (record[1] > 0 && balancing_counter++ >= balancing_pullback) {
+          balancing_counter -= balancing_pullback;
+          n_iters++;
+        }
+      }
+      if (n_iters > n_accounted_iters) { reserve_random_donor_state(n_iters); }
+    }
   }
 }
 
