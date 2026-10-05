@@ -22,6 +22,11 @@
 #include <raft/util/fast_int_div.cuh>
 #include <rmm/cuda_stream_pool.hpp>
 
+#include <algorithm>
+#include <memory>
+#include <optional>
+#include <vector>
+
 namespace cuvs::neighbors::ivf_flat {
 
 struct test_ivf_sample_filter {
@@ -41,6 +46,10 @@ struct AnnIvfFlatInputs {
   bool host_dataset = false;
   // The kernel_copy_overlapping option is only applicable when host dataset is enabled.
   bool kernel_copy_overlapping = false;
+  // By default, testPacker and testFilter reuse the index trained by testIVFFlat. If set, they
+  // build their own indexes instead (kmeans_trainset_fraction = 1 and add_data_on_build = true,
+  // respectively), and the case does not use the index cache of the fixture.
+  bool independent_builds = false;
 };
 
 template <typename IdxT>
@@ -50,7 +59,7 @@ template <typename IdxT>
      << p.nprobe << ", " << p.nlist << ", "
      << cuvs::neighbors::print_metric{static_cast<cuvs::distance::DistanceType>((int)p.metric)}
      << ", " << p.adaptive_centers << "," << p.host_dataset << "," << p.kernel_copy_overlapping
-     << '}';
+     << "," << p.independent_builds << '}';
   return os;
 }
 
@@ -106,78 +115,13 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
       rmm::device_uvector<IdxT> indices_ivfflat_dev(queries_size, stream_);
 
       {
-        cuvs::neighbors::ivf_flat::index_params index_params;
         cuvs::neighbors::ivf_flat::search_params search_params;
-        index_params.n_lists          = ps.nlist;
-        index_params.metric           = ps.metric;
-        index_params.adaptive_centers = ps.adaptive_centers;
-        search_params.n_probes        = ps.nprobe;
+        search_params.n_probes = ps.nprobe;
 
-        index_params.add_data_on_build        = false;
-        index_params.kmeans_trainset_fraction = 0.5;
-        index_params.metric_arg               = 0;
-
-        cuvs::neighbors::ivf_flat::index<DataT, IdxT> idx(handle_, index_params, ps.dim);
-        cuvs::neighbors::ivf_flat::index<DataT, IdxT> index_2(handle_, index_params, ps.dim);
-
-        if (!ps.host_dataset) {
-          auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
-            (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
-          idx = cuvs::neighbors::ivf_flat::build(handle_, index_params, database_view);
-          auto vector_indices = raft::make_device_vector<IdxT, IdxT>(handle_, ps.num_db_vecs);
-          raft::linalg::map_offset(handle_, vector_indices.view(), raft::identity_op{});
-          raft::resource::sync_stream(handle_);
-
-          IdxT half_of_data = ps.num_db_vecs / 2;
-
-          auto half_of_data_view = raft::make_device_matrix_view<const DataT, IdxT>(
-            (const DataT*)database.data(), half_of_data, ps.dim);
-
-          const std::optional<raft::device_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
-          index_2 = cuvs::neighbors::ivf_flat::extend(handle_, half_of_data_view, no_opt, idx);
-
-          auto new_half_of_data_view = raft::make_device_matrix_view<const DataT, IdxT>(
-            database.data() + half_of_data * ps.dim, IdxT(ps.num_db_vecs) - half_of_data, ps.dim);
-
-          auto new_half_of_data_indices_view = raft::make_device_vector_view<const IdxT, IdxT>(
-            vector_indices.data_handle() + half_of_data, IdxT(ps.num_db_vecs) - half_of_data);
-
-          cuvs::neighbors::ivf_flat::extend(
-            handle_,
-            new_half_of_data_view,
-            std::make_optional<raft::device_vector_view<const IdxT, IdxT>>(
-              new_half_of_data_indices_view),
-            &index_2);
-        } else {
-          auto host_database = raft::make_host_matrix<DataT, IdxT>(ps.num_db_vecs, ps.dim);
-          raft::copy(
-            host_database.data_handle(), database.data(), ps.num_db_vecs * ps.dim, stream_);
-          idx =
-            ivf_flat::build(handle_, index_params, raft::make_const_mdspan(host_database.view()));
-
-          auto vector_indices = raft::make_host_vector<IdxT>(handle_, ps.num_db_vecs);
-          std::iota(vector_indices.data_handle(), vector_indices.data_handle() + ps.num_db_vecs, 0);
-
-          IdxT half_of_data = ps.num_db_vecs / 2;
-
-          auto half_of_data_view = raft::make_host_matrix_view<const DataT, IdxT>(
-            (const DataT*)host_database.data_handle(), half_of_data, ps.dim);
-
-          const std::optional<raft::host_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
-          index_2 = ivf_flat::extend(handle_, half_of_data_view, no_opt, idx);
-
-          auto new_half_of_data_view = raft::make_host_matrix_view<const DataT, IdxT>(
-            host_database.data_handle() + half_of_data * ps.dim,
-            IdxT(ps.num_db_vecs) - half_of_data,
-            ps.dim);
-          auto new_half_of_data_indices_view = raft::make_host_vector_view<const IdxT, IdxT>(
-            vector_indices.data_handle() + half_of_data, IdxT(ps.num_db_vecs) - half_of_data);
-          ivf_flat::extend(handle_,
-                           new_half_of_data_view,
-                           std::make_optional<raft::host_vector_view<const IdxT, IdxT>>(
-                             new_half_of_data_indices_view),
-                           &index_2);
-        }
+        // A case with the build_key of a cached case searches the cached indexes; these passed all
+        // the checks that do not depend on the search parameters.
+        if (!cached_) { ASSERT_NO_FATAL_FAILURE(buildIndexes()); }
+        const auto& index_loaded = cached_ ? cached_->loaded : *loaded_;
 
         auto search_queries_view = raft::make_device_matrix_view<const DataT, IdxT>(
           search_queries.data(), ps.num_queries, ps.dim);
@@ -185,12 +129,6 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
           indices_ivfflat_dev.data(), ps.num_queries, ps.k);
         auto dists_out_view = raft::make_device_matrix_view<T, IdxT>(
           distances_ivfflat_dev.data(), ps.num_queries, ps.k);
-        tmp_index_file index_file;
-        cuvs::neighbors::ivf_flat::serialize(handle_, index_file.filename, index_2);
-        cuvs::neighbors::ivf_flat::index<DataT, IdxT> index_loaded(handle_);
-        cuvs::neighbors::ivf_flat::deserialize(handle_, index_file.filename, &index_loaded);
-        ASSERT_EQ(index_2.size(), index_loaded.size());
-
         cuvs::neighbors::ivf_flat::search(handle_,
                                           search_params,
                                           index_loaded,
@@ -204,44 +142,8 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
           indices_ivfflat.data(), indices_ivfflat_dev.data(), queries_size, stream_);
         raft::resource::sync_stream(handle_);
 
-        // Test the centroid invariants
-        if (index_2.adaptive_centers()) {
-          // The centers must be up-to-date with the corresponding data
-          std::vector<uint32_t> list_sizes(index_2.n_lists());
-          std::vector<IdxT*> list_indices(index_2.n_lists());
-          rmm::device_uvector<float> centroid(ps.dim, stream_);
-          raft::copy(
-            list_sizes.data(), index_2.list_sizes().data_handle(), index_2.n_lists(), stream_);
-          raft::copy(
-            list_indices.data(), index_2.inds_ptrs().data_handle(), index_2.n_lists(), stream_);
-          raft::resource::sync_stream(handle_);
-          for (uint32_t l = 0; l < index_2.n_lists(); l++) {
-            if (list_sizes[l] == 0) continue;
-            rmm::device_uvector<float> cluster_data(list_sizes[l] * ps.dim, stream_);
-            cuvs::spatial::knn::detail::utils::copy_selected<float>((IdxT)list_sizes[l],
-                                                                    (IdxT)ps.dim,
-                                                                    database.data(),
-                                                                    list_indices[l],
-                                                                    (IdxT)ps.dim,
-                                                                    cluster_data.data(),
-                                                                    (IdxT)ps.dim,
-                                                                    stream_);
-            raft::stats::mean<true, float, uint32_t>(
-              centroid.data(), cluster_data.data(), ps.dim, list_sizes[l], false, stream_.get());
-            ASSERT_TRUE(cuvs::devArrMatch(index_2.centers().data_handle() + ps.dim * l,
-                                          centroid.data(),
-                                          ps.dim,
-                                          cuvs::CompareApprox<float>(0.001),
-                                          stream_.get()));
-          }
-        } else {
-          // The centers must be immutable
-          ASSERT_TRUE(cuvs::devArrMatch(index_2.centers().data_handle(),
-                                        idx.centers().data_handle(),
-                                        index_2.centers().size(),
-                                        cuvs::Compare<float>(),
-                                        stream_.get()));
-        }
+        // Keep `loaded_` for the cache only if it can be cached (see TearDown()).
+        if (loaded_ && !cacheable(device_bytes(*loaded_))) { loaded_.reset(); }
       }
       float eps = std::is_same_v<DataT, half> ? 0.005 : 0.001;
       ASSERT_TRUE(eval_neighbours(indices_naive,
@@ -255,33 +157,165 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
     }
   }
 
-  void testPacker()
+  /**
+   * Trains the index of the case (`trained_`), adds the database to a copy of it with two calls to
+   * `extend`, round-trips that through a file (`loaded_`) and checks the result. Skipped if the
+   * case reuses the indexes of an earlier case with the same build_key.
+   */
+  void buildIndexes()
   {
-    ivf_flat::index_params index_params;
-    ivf_flat::search_params search_params;
+    cuvs::neighbors::ivf_flat::index_params index_params;
     index_params.n_lists          = ps.nlist;
     index_params.metric           = ps.metric;
-    index_params.adaptive_centers = false;
-    search_params.n_probes        = ps.nprobe;
+    index_params.adaptive_centers = ps.adaptive_centers;
 
     index_params.add_data_on_build        = false;
-    index_params.kmeans_trainset_fraction = 1.0;
+    index_params.kmeans_trainset_fraction = 0.5;
     index_params.metric_arg               = 0;
 
-    auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
-      (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
+    auto& idx = trained_.emplace(handle_, index_params, ps.dim);
+    cuvs::neighbors::ivf_flat::index<DataT, IdxT> index_2(handle_, index_params, ps.dim);
 
-    auto idx = ivf_flat::build(handle_, index_params, database_view);
+    if (!ps.host_dataset) {
+      auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
+        (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
+      idx                 = cuvs::neighbors::ivf_flat::build(handle_, index_params, database_view);
+      auto vector_indices = raft::make_device_vector<IdxT, IdxT>(handle_, ps.num_db_vecs);
+      raft::linalg::map_offset(handle_, vector_indices.view(), raft::identity_op{});
+      raft::resource::sync_stream(handle_);
 
-    const std::optional<raft::device_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
-    index<DataT, IdxT> extend_index = ivf_flat::extend(handle_, database_view, no_opt, idx);
+      IdxT half_of_data = ps.num_db_vecs / 2;
 
-    auto list_sizes = raft::make_host_vector<uint32_t>(idx.n_lists());
+      auto half_of_data_view = raft::make_device_matrix_view<const DataT, IdxT>(
+        (const DataT*)database.data(), half_of_data, ps.dim);
+
+      const std::optional<raft::device_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
+      index_2 = cuvs::neighbors::ivf_flat::extend(handle_, half_of_data_view, no_opt, idx);
+
+      auto new_half_of_data_view = raft::make_device_matrix_view<const DataT, IdxT>(
+        database.data() + half_of_data * ps.dim, IdxT(ps.num_db_vecs) - half_of_data, ps.dim);
+
+      auto new_half_of_data_indices_view = raft::make_device_vector_view<const IdxT, IdxT>(
+        vector_indices.data_handle() + half_of_data, IdxT(ps.num_db_vecs) - half_of_data);
+
+      cuvs::neighbors::ivf_flat::extend(
+        handle_,
+        new_half_of_data_view,
+        std::make_optional<raft::device_vector_view<const IdxT, IdxT>>(
+          new_half_of_data_indices_view),
+        &index_2);
+    } else {
+      auto host_database = raft::make_host_matrix<DataT, IdxT>(ps.num_db_vecs, ps.dim);
+      raft::copy(host_database.data_handle(), database.data(), ps.num_db_vecs * ps.dim, stream_);
+      idx = ivf_flat::build(handle_, index_params, raft::make_const_mdspan(host_database.view()));
+
+      auto vector_indices = raft::make_host_vector<IdxT>(handle_, ps.num_db_vecs);
+      std::iota(vector_indices.data_handle(), vector_indices.data_handle() + ps.num_db_vecs, 0);
+
+      IdxT half_of_data = ps.num_db_vecs / 2;
+
+      auto half_of_data_view = raft::make_host_matrix_view<const DataT, IdxT>(
+        (const DataT*)host_database.data_handle(), half_of_data, ps.dim);
+
+      const std::optional<raft::host_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
+      index_2 = ivf_flat::extend(handle_, half_of_data_view, no_opt, idx);
+
+      auto new_half_of_data_view = raft::make_host_matrix_view<const DataT, IdxT>(
+        host_database.data_handle() + half_of_data * ps.dim,
+        IdxT(ps.num_db_vecs) - half_of_data,
+        ps.dim);
+      auto new_half_of_data_indices_view = raft::make_host_vector_view<const IdxT, IdxT>(
+        vector_indices.data_handle() + half_of_data, IdxT(ps.num_db_vecs) - half_of_data);
+      ivf_flat::extend(
+        handle_,
+        new_half_of_data_view,
+        std::make_optional<raft::host_vector_view<const IdxT, IdxT>>(new_half_of_data_indices_view),
+        &index_2);
+    }
+
+    tmp_index_file index_file;
+    cuvs::neighbors::ivf_flat::serialize(handle_, index_file.filename, index_2);
+    auto& index_loaded = loaded_.emplace(handle_);
+    cuvs::neighbors::ivf_flat::deserialize(handle_, index_file.filename, &index_loaded);
+    ASSERT_EQ(index_2.size(), index_loaded.size());
+
+    // Test the centroid invariants
+    if (index_2.adaptive_centers()) {
+      // The centers must be up-to-date with the corresponding data
+      std::vector<uint32_t> list_sizes(index_2.n_lists());
+      std::vector<IdxT*> list_indices(index_2.n_lists());
+      rmm::device_uvector<float> centroid(ps.dim, stream_);
+      raft::copy(list_sizes.data(), index_2.list_sizes().data_handle(), index_2.n_lists(), stream_);
+      raft::copy(
+        list_indices.data(), index_2.inds_ptrs().data_handle(), index_2.n_lists(), stream_);
+      raft::resource::sync_stream(handle_);
+      for (uint32_t l = 0; l < index_2.n_lists(); l++) {
+        if (list_sizes[l] == 0) continue;
+        rmm::device_uvector<float> cluster_data(list_sizes[l] * ps.dim, stream_);
+        cuvs::spatial::knn::detail::utils::copy_selected<float>((IdxT)list_sizes[l],
+                                                                (IdxT)ps.dim,
+                                                                database.data(),
+                                                                list_indices[l],
+                                                                (IdxT)ps.dim,
+                                                                cluster_data.data(),
+                                                                (IdxT)ps.dim,
+                                                                stream_);
+        raft::stats::mean<true, float, uint32_t>(
+          centroid.data(), cluster_data.data(), ps.dim, list_sizes[l], false, stream_.get());
+        ASSERT_TRUE(cuvs::devArrMatch(index_2.centers().data_handle() + ps.dim * l,
+                                      centroid.data(),
+                                      ps.dim,
+                                      cuvs::CompareApprox<float>(0.001),
+                                      stream_.get()));
+      }
+    } else {
+      // The centers must be immutable
+      ASSERT_TRUE(cuvs::devArrMatch(index_2.centers().data_handle(),
+                                    idx.centers().data_handle(),
+                                    index_2.centers().size(),
+                                    cuvs::Compare<float>(),
+                                    stream_.get()));
+    }
+  }
+
+  void testPacker()
+  {
+    // The packer checks depend only on the build_key; they passed for the cached indexes.
+    if (cached_) { return; }
+
+    // The reference: all database rows added to an empty, trained index with `extend`.
+    std::optional<index<DataT, IdxT>> own_extend_index;
+    if (ps.independent_builds) {
+      ivf_flat::index_params index_params;
+      index_params.n_lists          = ps.nlist;
+      index_params.metric           = ps.metric;
+      index_params.adaptive_centers = false;
+
+      index_params.add_data_on_build        = false;
+      index_params.kmeans_trainset_fraction = 1.0;
+      index_params.metric_arg               = 0;
+
+      auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
+        (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
+
+      auto trained_index = ivf_flat::build(handle_, index_params, database_view);
+
+      const std::optional<raft::device_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
+      own_extend_index.emplace(ivf_flat::extend(handle_, database_view, no_opt, trained_index));
+    }
+    const auto& extend_index = own_extend_index ? *own_extend_index : full_index();
+
+    auto list_sizes = raft::make_host_vector<uint32_t>(extend_index.n_lists());
     raft::update_host(list_sizes.data_handle(),
                       extend_index.list_sizes().data_handle(),
                       extend_index.n_lists(),
                       stream_);
     raft::resource::sync_stream(handle_);
+
+    // An empty index of the same shape to pack the flat codes into.
+    index<DataT, IdxT> idx(
+      handle_, extend_index.metric(), extend_index.n_lists(), false, false, extend_index.dim());
+    ivf_flat::helpers::reset_index(handle_, &idx);
 
     auto& lists = idx.lists();
 
@@ -431,21 +465,27 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
         raft::make_device_matrix<IdxT, IdxT>(handle_, ps.num_queries, ps.k);
 
       {
-        ivf_flat::index_params index_params;
         ivf_flat::search_params search_params;
-        index_params.n_lists          = ps.nlist;
-        index_params.metric           = ps.metric;
-        index_params.adaptive_centers = ps.adaptive_centers;
-        search_params.n_probes        = ps.nprobe;
+        search_params.n_probes = ps.nprobe;
 
-        index_params.add_data_on_build        = true;
-        index_params.kmeans_trainset_fraction = 0.5;
-        index_params.metric_arg               = 0;
+        // Create IVF Flat index. By default, reuse the index trained by testIVFFlat, extended with
+        // the whole database: that is what `build` with `add_data_on_build = true` does.
+        std::optional<ivf_flat::index<DataT, IdxT>> own_index;
+        if (ps.independent_builds) {
+          ivf_flat::index_params index_params;
+          index_params.n_lists          = ps.nlist;
+          index_params.metric           = ps.metric;
+          index_params.adaptive_centers = ps.adaptive_centers;
 
-        // Create IVF Flat index
-        auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
-          (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
-        auto index = ivf_flat::build(handle_, index_params, database_view);
+          index_params.add_data_on_build        = true;
+          index_params.kmeans_trainset_fraction = 0.5;
+          index_params.metric_arg               = 0;
+
+          auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
+            (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
+          own_index.emplace(ivf_flat::build(handle_, index_params, database_view));
+        }
+        const auto& index = own_index ? *own_index : full_index();
 
         // Create Bitset filter
         auto removed_indices =
@@ -505,21 +545,148 @@ class AnnIVFFlatTest : public ::testing::TestWithParam<AnnIvfFlatInputs<IdxT>> {
         handle_, r, search_queries.data(), ps.num_queries * ps.dim, DataT(1), DataT(20));
     }
     raft::resource::sync_stream(handle_);
+
+    if (!ps.independent_builds) {
+      auto key = make_build_key(ps);
+      auto it  = std::find_if(index_cache_.begin(), index_cache_.end(), [&key](const auto& entry) {
+        return entry->key == key;
+      });
+      if (it != index_cache_.end()) {
+        cached_ = *it;
+        // Mark the entry as the most recently used one.
+        std::rotate(index_cache_.begin(), it, std::next(it));
+      }
+    }
   }
 
   void TearDown() override
   {
     raft::resource::sync_stream(handle_);
+    // Only indexes that passed all checks are cached.
+    if (loaded_.has_value() && full_.has_value() && !::testing::Test::HasFailure()) {
+      cacheIndexes();
+    }
     database.resize(0, stream_);
     search_queries.resize(0, stream_);
   }
 
+  static void TearDownTestSuite() { index_cache_.clear(); }
+
  private:
+  /**
+   * Everything that determines the database and the indexes of a case. SetUp() draws the database
+   * first from a fixed seed, so it depends only on (num_db_vecs, dim) and DataT; each fixture
+   * instantiation has its own cache. The other parameters (num_queries, k, nprobe) only affect the
+   * queries and the searches.
+   */
+  struct build_key {
+    IdxT num_db_vecs;
+    IdxT dim;
+    IdxT nlist;
+    cuvs::distance::DistanceType metric;
+    bool adaptive_centers;
+    bool host_dataset;
+    bool kernel_copy_overlapping;
+
+    bool operator==(const build_key&) const = default;
+  };
+
+  static auto make_build_key(const AnnIvfFlatInputs<IdxT>& p) -> build_key
+  {
+    return build_key{p.num_db_vecs,
+                     p.dim,
+                     p.nlist,
+                     p.metric,
+                     p.adaptive_centers,
+                     p.host_dataset,
+                     p.kernel_copy_overlapping};
+  }
+
+  /** The indexes of a case that passed all checks. They are not modified after construction. */
+  struct built_indexes {
+    build_key key;
+    /** See `loaded_`. */
+    index<DataT, IdxT> loaded;
+    /** See `full_index()`. */
+    index<DataT, IdxT> full;
+    size_t bytes;
+  };
+
+  /**
+   * Least-recently-used cache of the indexes of earlier cases, so that cases that differ only in
+   * the search parameters do not build and check the same indexes again. It holds at most
+   * kIndexCacheBytes of device memory and is cleared in TearDownTestSuite().
+   */
+  static constexpr size_t kIndexCacheBytes = size_t{256} << 20;
+  inline static std::vector<std::shared_ptr<const built_indexes>> index_cache_;
+
+  static auto device_bytes(const index<DataT, IdxT>& idx) -> size_t
+  {
+    size_t bytes = idx.centers().size() * sizeof(float);
+    for (const auto& list : idx.lists()) {
+      if (list) { bytes += list->data_byte_size() + list->indices_capacity() * sizeof(IdxT); }
+    }
+    return bytes;
+  }
+
+  /** Whether a cache entry of two indexes of `index_bytes` each would fit into the cache. */
+  auto cacheable(size_t index_bytes) const -> bool
+  {
+    return !ps.independent_builds && 2 * index_bytes <= kIndexCacheBytes;
+  }
+
+  void cacheIndexes()
+  {
+    size_t bytes = device_bytes(*loaded_) + device_bytes(*full_);
+    if (bytes > kIndexCacheBytes) { return; }
+    index_cache_.insert(index_cache_.begin(),
+                        std::make_shared<const built_indexes>(built_indexes{
+                          make_build_key(ps), std::move(*loaded_), std::move(*full_), bytes}));
+    loaded_.reset();
+    full_.reset();
+    // Evict the least recently used entries that do not fit anymore.
+    size_t total = 0;
+    auto it      = index_cache_.begin();
+    for (; it != index_cache_.end() && total + (*it)->bytes <= kIndexCacheBytes; ++it) {
+      total += (*it)->bytes;
+    }
+    index_cache_.erase(it, index_cache_.end());
+  }
+
+  /**
+   * The index trained by testIVFFlat (`trained_`), extended with the whole database at once. This
+   * is what `build` with `add_data_on_build = true` produces: it trains the index and then extends
+   * it with the dataset and no explicit indices.
+   */
+  auto full_index() -> const index<DataT, IdxT>&
+  {
+    if (cached_) { return cached_->full; }
+    if (!full_) {
+      RAFT_EXPECTS(trained_.has_value(),
+                   "testIVFFlat() must run before testPacker() and testFilter()");
+      auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
+        (const DataT*)database.data(), ps.num_db_vecs, ps.dim);
+      const std::optional<raft::device_vector_view<const IdxT, IdxT>> no_opt = std::nullopt;
+      full_.emplace(ivf_flat::extend(handle_, database_view, no_opt, *trained_));
+    }
+    return *full_;
+  }
+
   raft::resources handle_;
   cuda::stream_ref stream_;
   AnnIvfFlatInputs<IdxT> ps;
   rmm::device_uvector<DataT> database;
   rmm::device_uvector<DataT> search_queries;
+
+  // The indexes of a case are built once and shared by its sub-tests (testIVFFlat, testPacker and
+  // testFilter), unless they are reused from an earlier case with the same build_key (`cached_`).
+  /** Trained, but empty (`add_data_on_build = false`); `extend` does not modify it. */
+  std::optional<index<DataT, IdxT>> trained_;
+  /** `trained_` extended with two halves of the database, serialized and deserialized. */
+  std::optional<index<DataT, IdxT>> loaded_;
+  /** See `full_index()`. */
+  std::optional<index<DataT, IdxT>> full_;
+  std::shared_ptr<const built_indexes> cached_;
 };
 
 const std::vector<AnnIvfFlatInputs<int64_t>> inputs = {
@@ -536,9 +703,32 @@ const std::vector<AnnIvfFlatInputs<int64_t>> inputs = {
   {1000, 10000, 8, 16, 40, 1024, cuvs::distance::DistanceType::InnerProduct, true},
   {1000, 10000, 8, 16, 40, 1024, cuvs::distance::DistanceType::CosineExpanded, true},
   {1000, 10000, 5, 16, 40, 1024, cuvs::distance::DistanceType::L2SqrtExpanded, false},
-  {1000, 10000, 5, 16, 40, 1024, cuvs::distance::DistanceType::CosineExpanded, false},
+  // The same as the {5, CosineExpanded, false} entry above, but with independent_builds:
+  // covers kmeans_trainset_fraction = 1 (testPacker) and add_data_on_build = true (testFilter).
+  {1000,
+   10000,
+   5,
+   16,
+   40,
+   1024,
+   cuvs::distance::DistanceType::CosineExpanded,
+   false,
+   false,
+   false,
+   true},
   {1000, 10000, 8, 16, 40, 1024, cuvs::distance::DistanceType::L2SqrtExpanded, true},
-  {1000, 10000, 8, 16, 40, 1024, cuvs::distance::DistanceType::CosineExpanded, true},
+  // The same as the {8, CosineExpanded, true} entry above, but with independent_builds.
+  {1000,
+   10000,
+   8,
+   16,
+   40,
+   1024,
+   cuvs::distance::DistanceType::CosineExpanded,
+   true,
+   false,
+   false,
+   true},
 
   // test dims that do not fit into kernel shared memory limits
   {1000, 10000, 2048, 16, 40, 1024, cuvs::distance::DistanceType::L2Expanded, false},
