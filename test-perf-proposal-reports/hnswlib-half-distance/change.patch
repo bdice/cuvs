@@ -1,0 +1,271 @@
+diff -ruN a/cpp/src/neighbors/detail/hnsw_half_distance.hpp b/cpp/src/neighbors/detail/hnsw_half_distance.hpp
+--- a/cpp/src/neighbors/detail/hnsw_half_distance.hpp	1969-12-31 18:00:00.000000000 -0600
++++ b/cpp/src/neighbors/detail/hnsw_half_distance.hpp	2026-10-05 04:57:48.732731342 -0500
+@@ -0,0 +1,206 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++// The F16C kernel is selected at run time, so the build does not need -mf16c.
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(__CUDACC__)
++#include <immintrin.h>
++#define CUVS_HNSW_HALF_DISTANCE_F16C 1
++#endif
++
++/**
++ * Host distance functions for fp16 (IEEE binary16) vectors, in hnswlib's `DISTFUNC<float>` form.
++ *
++ * hnswlib's generic `L2Sqr` / `InnerProduct` templates evaluate `half - half` and `half * half`
++ * with the host `cuda_fp16` operators. Those convert both operands to float in software, round
++ * the result back to fp16 and convert it to float again, for every element. That is slow, and it
++ * rounds every difference or product to fp16.
++ *
++ * The functions below widen every element to float and accumulate in float. On x86 CPUs with F16C
++ * (detected at run time) eight elements are converted per instruction; elsewhere a portable,
++ * branch-free conversion is used. Both kernels keep the same 16 partial sums and reduce them in
++ * the same order.
++ */
++namespace cuvs::neighbors::hnsw::detail {
++
++/** Number of partial sums kept by the half distance kernels. */
++inline constexpr size_t kHalfDistanceLanes = 16;
++
++inline auto fp32_from_bits(uint32_t bits) noexcept -> float
++{
++  float value;
++  std::memcpy(&value, &bits, sizeof(value));
++  return value;
++}
++
++inline auto fp32_to_bits(float value) noexcept -> uint32_t
++{
++  uint32_t bits;
++  std::memcpy(&bits, &value, sizeof(bits));
++  return bits;
++}
++
++/** Exact IEEE binary16 -> binary32 conversion without branches (handles subnormals, inf, NaN). */
++inline auto half_bits_to_float(uint16_t h) noexcept -> float
++{
++  const uint32_t w     = static_cast<uint32_t>(h) << 16;
++  const uint32_t sign  = w & 0x80000000u;
++  const uint32_t two_w = w + w;
++  // Normal numbers, inf and NaN: move exponent and mantissa into place, then re-bias the exponent
++  // with an exact multiplication by 2^-112.
++  const float normal = fp32_from_bits((two_w >> 4) + (0xE0u << 23)) * 0x1.0p-112f;
++  // Subnormals and zero: build 0.5 + m * 2^-24 and subtract 0.5 (exact).
++  const float subnormal = fp32_from_bits((two_w >> 17) | (126u << 23)) - 0.5f;
++  // Bitwise select (rather than a branch) so the element loops vectorize.
++  const uint32_t subnormal_mask = 0u - static_cast<uint32_t>(two_w < (1u << 27));
++  const uint32_t magnitude =
++    (fp32_to_bits(subnormal) & subnormal_mask) | (fp32_to_bits(normal) & ~subnormal_mask);
++  return fp32_from_bits(sign | magnitude);
++}
++
++/** One element's contribution: x * y, or (x - y)^2. */
++template <bool InnerProduct>
++inline auto half_distance_term(float x, float y) noexcept -> float
++{
++  if constexpr (InnerProduct) {
++    return x * y;
++  } else {
++    const float d = x - y;
++    return d * d;
++  }
++}
++
++/** hnswlib's inner product "distance" is 1 - <a, b>. */
++template <bool InnerProduct>
++inline auto half_distance_result(float sum) noexcept -> float
++{
++  if constexpr (InnerProduct) { return 1.0f - sum; }
++  return sum;
++}
++
++/** Adds the partial sums with a fixed pairwise tree (the order used by the F16C kernel). */
++inline auto half_distance_reduce(float* acc) noexcept -> float
++{
++  for (size_t width = kHalfDistanceLanes / 2; width > 1; width /= 2) {
++    for (size_t j = 0; j < width; j++) {
++      acc[j] += acc[j + width];
++    }
++  }
++  return acc[0] + acc[1];
++}
++
++/** Portable kernel: squared L2 distance or (1 - inner product) of two fp16 vectors. */
++template <bool InnerProduct>
++inline auto half_distance_generic(const void* p_a, const void* p_b, const void* p_dim) -> float
++{
++  const auto* a    = static_cast<const uint16_t*>(p_a);
++  const auto* b    = static_cast<const uint16_t*>(p_b);
++  const size_t dim = *static_cast<const size_t*>(p_dim);
++
++  float acc[kHalfDistanceLanes] = {};
++  size_t i                      = 0;
++  for (; i + kHalfDistanceLanes <= dim; i += kHalfDistanceLanes) {
++    for (size_t j = 0; j < kHalfDistanceLanes; j++) {
++      acc[j] += half_distance_term<InnerProduct>(half_bits_to_float(a[i + j]),
++                                                 half_bits_to_float(b[i + j]));
++    }
++  }
++  // The remaining elements go to the first lanes (the F16C kernel zero-pads them).
++  for (size_t j = 0; i + j < dim; j++) {
++    acc[j] +=
++      half_distance_term<InnerProduct>(half_bits_to_float(a[i + j]), half_bits_to_float(b[i + j]));
++  }
++  return half_distance_result<InnerProduct>(half_distance_reduce(acc));
++}
++
++#ifdef CUVS_HNSW_HALF_DISTANCE_F16C
++/** Loads eight fp16 values and widens them to float. */
++[[gnu::target("avx,f16c")]] inline auto load_half8_as_float(const uint16_t* p) -> __m256
++{
++  return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
++}
++
++/** Adds the contribution of 16 elements to the partial sums (lanes 0-7 and 8-15). */
++template <bool InnerProduct>
++[[gnu::target("avx,f16c")]] inline void half_distance_block(const uint16_t* a,
++                                                            const uint16_t* b,
++                                                            __m256& acc_lo,
++                                                            __m256& acc_hi)
++{
++  const __m256 x_lo = load_half8_as_float(a);
++  const __m256 x_hi = load_half8_as_float(a + 8);
++  const __m256 y_lo = load_half8_as_float(b);
++  const __m256 y_hi = load_half8_as_float(b + 8);
++  if constexpr (InnerProduct) {
++    acc_lo = _mm256_add_ps(acc_lo, _mm256_mul_ps(x_lo, y_lo));
++    acc_hi = _mm256_add_ps(acc_hi, _mm256_mul_ps(x_hi, y_hi));
++  } else {
++    const __m256 d_lo = _mm256_sub_ps(x_lo, y_lo);
++    const __m256 d_hi = _mm256_sub_ps(x_hi, y_hi);
++    acc_lo            = _mm256_add_ps(acc_lo, _mm256_mul_ps(d_lo, d_lo));
++    acc_hi            = _mm256_add_ps(acc_hi, _mm256_mul_ps(d_hi, d_hi));
++  }
++}
++
++/** F16C kernel: same partial sums and reduction order as `half_distance_generic`. */
++template <bool InnerProduct>
++[[gnu::target("avx,f16c")]] inline auto half_distance_f16c(const void* p_a,
++                                                           const void* p_b,
++                                                           const void* p_dim) -> float
++{
++  const auto* a    = static_cast<const uint16_t*>(p_a);
++  const auto* b    = static_cast<const uint16_t*>(p_b);
++  const size_t dim = *static_cast<const size_t*>(p_dim);
++
++  __m256 acc_lo = _mm256_setzero_ps();
++  __m256 acc_hi = _mm256_setzero_ps();
++  size_t i      = 0;
++  for (; i + kHalfDistanceLanes <= dim; i += kHalfDistanceLanes) {
++    half_distance_block<InnerProduct>(a + i, b + i, acc_lo, acc_hi);
++  }
++  if (i < dim) {
++    // Zero padding adds +0 to the unused lanes, which leaves them unchanged.
++    uint16_t a_tail[kHalfDistanceLanes] = {};
++    uint16_t b_tail[kHalfDistanceLanes] = {};
++    std::memcpy(a_tail, a + i, (dim - i) * sizeof(uint16_t));
++    std::memcpy(b_tail, b + i, (dim - i) * sizeof(uint16_t));
++    half_distance_block<InnerProduct>(a_tail, b_tail, acc_lo, acc_hi);
++  }
++  // Same pairwise tree as half_distance_reduce: lanes j + 8, then j + 4, j + 2 and j + 1.
++  const __m256 sum8 = _mm256_add_ps(acc_lo, acc_hi);
++  const __m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(sum8), _mm256_extractf128_ps(sum8, 1));
++  const __m128 sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
++  const __m128 sum1 = _mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 1));
++  return half_distance_result<InnerProduct>(_mm_cvtss_f32(sum1));
++}
++
++inline auto cpu_supports_f16c() -> bool
++{
++  static const bool supported = [] {
++    __builtin_cpu_init();
++    return __builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c");
++  }();
++  return supported;
++}
++#endif
++
++using half_distance_func = float (*)(const void*, const void*, const void*);
++
++/** Returns the fastest half distance kernel for this CPU: squared L2, or 1 - inner product. */
++template <bool InnerProduct>
++inline auto select_half_distance() -> half_distance_func
++{
++#ifdef CUVS_HNSW_HALF_DISTANCE_F16C
++  if (cpu_supports_f16c()) { return &half_distance_f16c<InnerProduct>; }
++#endif
++  return &half_distance_generic<InnerProduct>;
++}
++
++}  // namespace cuvs::neighbors::hnsw::detail
+diff -ruN a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
+--- a/cpp/src/neighbors/detail/hnsw.hpp	2026-10-05 04:57:48.720731347 -0500
++++ b/cpp/src/neighbors/detail/hnsw.hpp	2026-10-05 04:57:48.723731346 -0500
+@@ -7,6 +7,7 @@
+ 
+ #include "../../core/nvtx.hpp"
+ #include "../../core/omp_wrapper.hpp"
++#include "hnsw_half_distance.hpp"
+ #include "hnsw_layered_format.hpp"
+ 
+ #include <cuvs/neighbors/brute_force.hpp>
+@@ -188,6 +189,29 @@
+   using type = int;
+ };
+ 
++/**
++ * hnswlib space for half vectors: squared L2 distance, or 1 - inner product.
++ *
++ * Same data layout as `hnswlib::L2Space<half, float>` / `hnswlib::InnerProductSpace<half, float>`,
++ * but each element is widened to float (see hnsw_half_distance.hpp) instead of rounding every
++ * difference or product to fp16 with the host `cuda_fp16` operators.
++ */
++template <bool InnerProduct>
++class half_space : public hnswlib::SpaceInterface<float> {
++ public:
++  explicit half_space(size_t dim) : dim_{dim}, dist_func_{select_half_distance<InnerProduct>()} {}
++
++  auto get_data_size() -> size_t override { return dim_ * sizeof(half); }
++
++  auto get_dist_func() -> hnswlib::DISTFUNC<float> override { return dist_func_; }
++
++  auto get_dist_func_param() -> void* override { return &dim_; }
++
++ private:
++  size_t dim_;
++  hnswlib::DISTFUNC<float> dist_func_;
++};
++
+ // Map the dataset element type to a cudaDataType_t. This is a host-only helper that
+ // intentionally avoids pulling CUDA/device dependencies.
+ template <typename T>
+@@ -231,10 +255,17 @@
+              HnswOutputFormat output_format = HnswOutputFormat::HNSWLIB)
+     : index<T>{dim, metric, hierarchy, output_format}
+   {
+-    if (metric == cuvs::distance::DistanceType::InnerProduct) {
++    if constexpr (std::is_same_v<T, half>) {
++      static_assert(sizeof(half) == sizeof(uint16_t), "half must be IEEE binary16");
++      if (metric == cuvs::distance::DistanceType::InnerProduct) {
++        space_ = std::make_unique<half_space<true>>(dim);
++      } else if (metric == cuvs::distance::DistanceType::L2Expanded) {
++        space_ = std::make_unique<half_space<false>>(dim);
++      }
++    } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+       space_ = std::make_unique<hnswlib::InnerProductSpace<T, typename hnsw_dist_t<T>::type>>(dim);
+     } else if (metric == cuvs::distance::DistanceType::L2Expanded) {
+-      if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
++      if constexpr (std::is_same_v<T, float>) {
+         space_ = std::make_unique<hnswlib::L2Space<T, typename hnsw_dist_t<T>::type>>(dim);
+       } else if constexpr (std::is_same_v<T, std::int8_t> or std::is_same_v<T, std::uint8_t>) {
+         space_ = std::make_unique<hnswlib::L2SpaceI<T>>(dim);

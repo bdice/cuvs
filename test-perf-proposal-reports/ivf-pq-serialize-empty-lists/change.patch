@@ -1,0 +1,22 @@
+--- a/cpp/src/neighbors/ivf_pq/ivf_pq_serialize.cuh
++++ b/cpp/src/neighbors/ivf_pq/ivf_pq_serialize.cuh
+@@ -74,14 +74,17 @@
+   if (index.codes_layout() == list_layout::FLAT) {
+     auto list_store_spec = list_spec_flat<uint32_t, IdxT>{index.pq_bits(), index.pq_dim(), true};
+     for (uint32_t label = 0; label < index.n_lists(); label++) {
+-      auto& typed_list = static_cast<const list_data_flat<IdxT>&>(*index.lists()[label]);
++      // Empty lists can be null (e.g. after deserialize), so pass the shared pointer.
++      auto typed_list = std::static_pointer_cast<list_data_flat<IdxT>>(index.lists()[label]);
+       ivf::serialize_list(handle_, os, typed_list, list_store_spec, sizes_host(label));
+     }
+   } else {
+     auto list_store_spec =
+       list_spec_interleaved<uint32_t, IdxT>{index.pq_bits(), index.pq_dim(), true};
+     for (uint32_t label = 0; label < index.n_lists(); label++) {
+-      auto& typed_list = static_cast<const list_data_interleaved<IdxT>&>(*index.lists()[label]);
++      // Empty lists can be null (e.g. after deserialize), so pass the shared pointer.
++      auto typed_list =
++        std::static_pointer_cast<list_data_interleaved<IdxT>>(index.lists()[label]);
+       ivf::serialize_list(handle_, os, typed_list, list_store_spec, sizes_host(label));
+     }
+   }

@@ -1,0 +1,104 @@
+diff --git a/.github/workflows/pr.yaml b/.github/workflows/pr.yaml
+index f59647b..ba177ed 100644
+--- a/.github/workflows/pr.yaml
++++ b/.github/workflows/pr.yaml
+@@ -521,6 +521,30 @@ jobs:
+     with:
+       build_type: pull-request
+       script: "ci/test_cpp.sh ${{ matrix.shard }} ${{ matrix.num_shards }}"
++      # Cache of the JIT-LTO kernels that nvJitLink links while the tests run (see ci/test_cpp.sh).
++      # With an empty cache, linking adds about 700 s of test time per CUDA/GPU configuration. The
++      # tests on main save one archive per shard and configuration (see test.yaml, and keep these
++      # settings in sync with it). PRs restore that archive but do not save their own, since other
++      # PRs could not restore it.
++      cache-paths: .cache/cuda-jit
++      cache-key-prefix: libcuvs-cuda-jit-v1-shard${{ matrix.shard }}of${{ matrix.num_shards }}
++      # Caches are immutable. Re-key when libcuvs or its tests change, so that a run on main can save
++      # the kernels it linked; every run first restores the most recent compatible archive.
++      cache-key-files: |
++        c/**
++        conda/recipes/libcuvs/**
++        cpp/**
++        dependencies.yaml
++      # The cached kernels depend on the GPU, the CUDA version (nvJitLink) and the driver, but not on
++      # the Python version, the OS image or the dependency set of the test environment.
++      cache-key-matrix-fields: |
++        CUDA_VER
++        ARCH
++        GPU
++        DRIVER
++      cache-read-only: true
++      cache-environment: |
++        CUDA_CACHE_PATH=.cache/cuda-jit
+   conda-cpp-checks:
+     needs: conda-cpp-build
+     permissions:
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 7e91643..9f79a67 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -61,6 +61,30 @@ jobs:
+       date: ${{ inputs.date }}
+       script: "ci/test_cpp.sh ${{ matrix.shard }} ${{ matrix.num_shards }}"
+       sha: ${{ inputs.sha }}
++      # Cache of the JIT-LTO kernels that nvJitLink links while the tests run (see ci/test_cpp.sh).
++      # With an empty cache, linking adds about 700 s of test time per CUDA/GPU configuration. Keep
++      # these settings in sync with the conda-cpp-tests job in pr.yaml, which restores the archives
++      # saved here.
++      cache-paths: .cache/cuda-jit
++      cache-key-prefix: libcuvs-cuda-jit-v1-shard${{ matrix.shard }}of${{ matrix.num_shards }}
++      # Caches are immutable. Re-key when libcuvs or its tests change, so that a run on main can save
++      # the kernels it linked; every run first restores the most recent compatible archive.
++      cache-key-files: |
++        c/**
++        conda/recipes/libcuvs/**
++        cpp/**
++        dependencies.yaml
++      # The cached kernels depend on the GPU, the CUDA version (nvJitLink) and the driver, but not on
++      # the Python version, the OS image or the dependency set of the test environment.
++      cache-key-matrix-fields: |
++        CUDA_VER
++        ARCH
++        GPU
++        DRIVER
++      # Only the tests on main save the archives that PRs restore.
++      cache-read-only: ${{ inputs.branch != 'main' }}
++      cache-environment: |
++        CUDA_CACHE_PATH=.cache/cuda-jit
+   conda-python-tests:
+     permissions:
+       actions: read
+diff --git a/ci/test_cpp.sh b/ci/test_cpp.sh
+index bd1fcfd..52bb27f 100755
+--- a/ci/test_cpp.sh
++++ b/ci/test_cpp.sh
+@@ -35,6 +35,18 @@ set -u
+ RAPIDS_TESTS_DIR=${RAPIDS_TESTS_DIR:-"${PWD}/test-results"}/
+ mkdir -p "${RAPIDS_TESTS_DIR}"
+ 
++# libcuvs links its JIT-LTO kernels at run time with nvJitLink, which stores the linked kernels in
++# the CUDA JIT cache (CUDA_CACHE_PATH, ~/.nv/ComputeCache by default). In CI, the conda-cpp-tests
++# jobs in .github/workflows/pr.yaml and test.yaml point CUDA_CACHE_PATH at a workspace directory
++# that actions/cache restores (and saves after the tests on main), so that kernels linked by an
++# earlier run are not linked again. Make the path absolute before ctest runs from another directory.
++if [[ -n "${CUDA_CACHE_PATH:-}" ]]; then
++  CUDA_CACHE_PATH=$(realpath -m "${CUDA_CACHE_PATH}")
++  export CUDA_CACHE_PATH
++  mkdir -p "${CUDA_CACHE_PATH}"
++  rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files before the tests"
++fi
++
+ rapids-print-env
+ 
+ rapids-logger "Check GPU usage"
+@@ -73,5 +85,10 @@ if [[ "${SHARD}" == "1" && "${KVIKIO_COMPAT_MODE}" == "ON" ]]; then
+ fi
+ popd
+ 
++if [[ -n "${CUDA_CACHE_PATH:-}" ]]; then
++  # Each kernel that was not in the cache and had to be linked adds files.
++  rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files ($(du -sh "${CUDA_CACHE_PATH}" | cut -f1)) after the tests"
++fi
++
+ rapids-logger "Test script exiting with value: $EXITCODE"
+ exit ${EXITCODE}

@@ -1,0 +1,122 @@
+diff --git a/cpp/tests/neighbors/ann_cagra/test_filter_udf.cu b/cpp/tests/neighbors/ann_cagra/test_filter_udf.cu
+--- a/cpp/tests/neighbors/ann_cagra/test_filter_udf.cu
++++ b/cpp/tests/neighbors/ann_cagra/test_filter_udf.cu
+@@ -49,40 +49,31 @@
+   std::vector<float> distances;
+ };
+ 
+-std::string accept_all_udf_source()
++// Each distinct UDF source is NVRTC-compiled and LTO-linked into every search kernel that uses it,
++// per data type and search algorithm: ~2 s per (source, data type) with a cold CUDA JIT cache.
++// The accept-all, reject-all and threshold tests therefore share this one source and select their
++// predicate at run time through `filter_data`: a source row passes iff its id is at least the
++// device-side `uint32_t` that `filter_data` points to, and `nullptr` accepts every row.
++std::string min_source_id_udf_source()
+ {
+   return R"cpp(
+-    __device__ bool cuvs_filter_udf(uint32_t, source_index_t, void*) { return true; }
+-  )cpp";
+-}
+-
+-std::string threshold_udf_source()
+-{
+-  return R"cpp(
+-    __device__ bool cuvs_filter_udf(uint32_t, source_index_t source_id, void*)
++    __device__ bool cuvs_filter_udf(uint32_t, source_index_t source_id, void* filter_data)
+     {
+-      return source_id >= 192;
++      if (filter_data == nullptr) { return true; }
++      return source_id >= *static_cast<const uint32_t*>(filter_data);
+     }
+   )cpp";
+ }
+ 
+-std::string reject_all_udf_source()
++// Device scalar for the `filter_data` argument of `min_source_id_udf_source()`.
++auto make_min_source_id(raft::resources const& res, int64_t min_source_id)
+ {
+-  return R"cpp(
+-    __device__ bool cuvs_filter_udf(uint32_t, source_index_t, void*) { return false; }
+-  )cpp";
+-}
+-
+-std::string high_filtering_rate_udf_source()
+-{
+-  return R"cpp(
+-    __device__ bool cuvs_filter_udf(uint32_t, source_index_t source_id, void*)
+-    {
+-      return source_id >= 704;
+-    }
+-  )cpp";
++  return raft::make_device_scalar<uint32_t>(res, static_cast<uint32_t>(min_source_id));
+ }
+ 
++// Intentionally a separate source: running it in the same process as `min_source_id_udf_source()`
++// also checks that two different UDFs for one data type get separate kernels (the JIT caches key on
++// the source text).
+ std::string tenant_udf_source()
+ {
+   return R"cpp(
+@@ -261,7 +252,7 @@
+   cuvs::neighbors::filtering::none_sample_filter no_filter;
+   auto expected = search(no_filter, 0.0f);
+ 
+-  cuvs::neighbors::filtering::udf_filter udf_filter(accept_all_udf_source(), nullptr, 0.0f);
++  cuvs::neighbors::filtering::udf_filter udf_filter(min_source_id_udf_source(), nullptr, 0.0f);
+   auto actual = search(udf_filter);
+ 
+   expect_same_results(expected, actual);
+@@ -270,8 +261,9 @@
+ TEST_P(CagraUdfFilterHalfTest, ThresholdReturnsOnlyValidNeighbors)
+ {
+   float const filtering_rate = static_cast<float>(threshold) / static_cast<float>(n_rows);
++  auto min_source_id         = make_min_source_id(res, threshold);
+   cuvs::neighbors::filtering::udf_filter udf_filter(
+-    threshold_udf_source(), nullptr, filtering_rate);
++    min_source_id_udf_source(), min_source_id.data_handle(), filtering_rate);
+   auto result = search(udf_filter, filtering_rate);
+ 
+   for (auto source_id : result.neighbors) {
+@@ -283,7 +275,10 @@
+ 
+ TEST_P(CagraUdfFilterTest, RejectAllReturnsNoValidNeighbors)
+ {
+-  cuvs::neighbors::filtering::udf_filter udf_filter(reject_all_udf_source(), nullptr, 0.999f);
++  // No row id is >= n_rows, so every row is rejected.
++  auto min_source_id = make_min_source_id(res, n_rows);
++  cuvs::neighbors::filtering::udf_filter udf_filter(
++    min_source_id_udf_source(), min_source_id.data_handle(), 0.999f);
+   auto result = search(udf_filter);
+ 
+   // CAGRA algorithms do not all normalize empty-result sentinels the same way. Single-CTA
+@@ -296,8 +291,9 @@
+ 
+ TEST_P(CagraUdfFilterTest, HighFilteringRateReturnsOnlyValidNeighbors)
+ {
++  auto min_source_id = make_min_source_id(res, high_filtering_threshold);
+   cuvs::neighbors::filtering::udf_filter udf_filter(
+-    high_filtering_rate_udf_source(), nullptr, high_filtering_rate);
++    min_source_id_udf_source(), min_source_id.data_handle(), high_filtering_rate);
+   auto result = search(udf_filter);
+ 
+   for (auto source_id : result.neighbors) {
+@@ -309,7 +305,7 @@
+ 
+ TEST_P(CagraUdfFilterTest, RepeatedUdfSearchWithSameSourceMatches)
+ {
+-  cuvs::neighbors::filtering::udf_filter udf_filter(accept_all_udf_source(), nullptr, 0.0f);
++  cuvs::neighbors::filtering::udf_filter udf_filter(min_source_id_udf_source(), nullptr, 0.0f);
+ 
+   auto first  = search(udf_filter);
+   auto second = search(udf_filter);
+@@ -339,8 +335,9 @@
+   float const filtering_rate = static_cast<float>(threshold) / static_cast<float>(n_rows);
+   auto expected              = search(bitset_filter, filtering_rate);
+ 
++  auto min_source_id = make_min_source_id(res, threshold);
+   cuvs::neighbors::filtering::udf_filter udf_filter(
+-    threshold_udf_source(), nullptr, filtering_rate);
++    min_source_id_udf_source(), min_source_id.data_handle(), filtering_rate);
+   auto actual = search(udf_filter, filtering_rate);
+ 
+   expect_same_results(expected, actual);
