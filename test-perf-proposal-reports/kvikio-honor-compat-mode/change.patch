@@ -1,0 +1,58 @@
+diff --git a/cpp/src/util/kvikio_io.hpp b/cpp/src/util/kvikio_io.hpp
+--- a/cpp/src/util/kvikio_io.hpp
++++ b/cpp/src/util/kvikio_io.hpp
+@@ -8,6 +8,7 @@
+ 
+ #if __has_include(<kvikio/compat_mode.hpp>)
+ #include <kvikio/compat_mode.hpp>
++#include <kvikio/defaults.hpp>
+ #define CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER 1
+ #else
+ #define CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER 0
+@@ -54,8 +55,18 @@
+ inline kvikio::FileHandle open_kvikio_file_for_device_io(const std::string& path,
+                                                          const std::string& flags)
+ {
+-  // Prefer GDS for device transfers, but retain KvikIO's automatic POSIX fallback when the
+-  // current system cannot open the file with compatibility mode disabled.
++#if CUVS_KVIKIO_HAS_COMPAT_MODE_HEADER
++  // Honour an explicit request for POSIX I/O (KVIKIO_COMPAT_MODE=ON, or
++  // kvikio::defaults::set_compat_mode(kvikio::CompatMode::ON)). Forcing CompatMode::OFF below
++  // registers the file with cuFile, which initializes the cuFile driver (about 1 s per process)
++  // even though KvikIO was asked not to use cuFile.
++  if (kvikio::defaults::compat_mode() == kvikio::CompatMode::ON) {
++    return kvikio::FileHandle(path, flags, kvikio::FileHandle::m644, kvikio::CompatMode::ON);
++  }
++#endif
++
++  // Otherwise prefer GDS for device transfers, but retain KvikIO's automatic POSIX fallback when
++  // the current system cannot open the file with compatibility mode disabled.
+   try {
+     return open_kvikio_file_compat_off(path, flags, 0);
+   } catch (const std::exception& e) {
+diff --git a/ci/test_cpp.sh b/ci/test_cpp.sh
+--- a/ci/test_cpp.sh
++++ b/ci/test_cpp.sh
+@@ -55,10 +55,22 @@
+   pytest cpp/tests/python
+ fi
+ 
++# Unless KvikIO's compatibility mode is ON, libcuvs opens files for device I/O through cuFile. That
++# initializes the cuFile driver, about 1 s in every test process that saves or loads an index, and
++# without GPUDirect Storage (not expected on the CI runners) cuFile then only falls back to POSIX
++# I/O. Use KvikIO's POSIX backend for the gtests; a job can override this by setting
++# KVIKIO_COMPAT_MODE itself. UTIL_TEST is rerun below in the default mode to keep the cuFile open
++# path covered.
++export KVIKIO_COMPAT_MODE="${KVIKIO_COMPAT_MODE:-ON}"
++
+ # Run libcuvs gtests from libcuvs-tests package
+ rapids-logger "Run libcuvs tests (shard ${SHARD} of ${NUM_SHARDS})"
+ pushd "$CONDA_PREFIX"/bin/gtests/libcuvs
+ ctest -j8 --output-on-failure -I "${SHARD},,${NUM_SHARDS}"
++if [[ "${SHARD}" == "1" && "${KVIKIO_COMPAT_MODE}" == "ON" ]]; then
++  rapids-logger "Run libcuvs file I/O tests with KVIKIO_COMPAT_MODE=AUTO"
++  KVIKIO_COMPAT_MODE=AUTO ctest --output-on-failure -R '^UTIL_TEST$'
++fi
+ popd
+ 
+ rapids-logger "Test script exiting with value: $EXITCODE"

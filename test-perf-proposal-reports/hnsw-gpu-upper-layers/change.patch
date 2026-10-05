@@ -1,0 +1,93 @@
+diff -ruN a/cpp/src/neighbors/detail/hnsw.hpp b/cpp/src/neighbors/detail/hnsw.hpp
+--- a/cpp/src/neighbors/detail/hnsw.hpp	2026-10-05 06:13:17.277749327 -0500
++++ b/cpp/src/neighbors/detail/hnsw.hpp	2026-10-05 06:13:17.279749326 -0500
+@@ -508,12 +508,89 @@
+   return cur_c;
+ }
+ 
++/**
++ * Exact k-NN graph of a small host dataset, without self edges, computed on the host.
++ *
++ * Rows are widened to float and compared by squared L2 distance or inner product. Ties are broken
++ * by the smaller row id, so the result is deterministic, and every id is in [0, n_rows) and differs
++ * from its own row.
++ */
++template <typename T>
++void exact_all_neighbors_graph(raft::host_matrix_view<const T, int64_t, raft::row_major> dataset,
++                               raft::host_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
++                               cuvs::distance::DistanceType metric)
++{
++  const int64_t n_rows = dataset.extent(0);
++  const int64_t dim    = dataset.extent(1);
++  const int64_t k      = neighbors.extent(1);
++  RAFT_EXPECTS(neighbors.extent(0) == n_rows,
++               "k-NN graph rows (%ld) must match the dataset rows (%ld)",
++               static_cast<long>(neighbors.extent(0)),
++               static_cast<long>(n_rows));
++  if (k == 0) { return; }
++  RAFT_EXPECTS(k < n_rows,
++               "k-NN graph degree (%ld) must be smaller than the number of rows (%ld)",
++               static_cast<long>(k),
++               static_cast<long>(n_rows));
++  const bool inner_product = metric == cuvs::distance::DistanceType::InnerProduct;
++
++  std::vector<float> data(static_cast<size_t>(n_rows * dim));
++  for (int64_t i = 0; i < n_rows; i++) {
++    for (int64_t j = 0; j < dim; j++) {
++      data[i * dim + j] = static_cast<float>(dataset(i, j));
++    }
++  }
++
++#pragma omp parallel
++  {
++    // (distance, id) pairs: the pair order sorts by distance, then by id.
++    std::vector<std::pair<float, uint32_t>> candidates(static_cast<size_t>(n_rows - 1));
++#pragma omp for
++    for (int64_t i = 0; i < n_rows; i++) {
++      const float* x = data.data() + i * dim;
++      size_t n_cand  = 0;
++      for (int64_t j = 0; j < n_rows; j++) {
++        if (j == i) { continue; }
++        const float* y = data.data() + j * dim;
++        float d        = 0.0f;
++        if (inner_product) {
++          for (int64_t l = 0; l < dim; l++) {
++            d += x[l] * y[l];
++          }
++          d = -d;  // a larger inner product is closer
++        } else {
++          for (int64_t l = 0; l < dim; l++) {
++            const float t = x[l] - y[l];
++            d += t * t;
++          }
++        }
++        if (std::isnan(d)) { d = std::numeric_limits<float>::infinity(); }
++        candidates[n_cand++] = {d, static_cast<uint32_t>(j)};
++      }
++      std::partial_sort(candidates.begin(), candidates.begin() + k, candidates.end());
++      for (int64_t j = 0; j < k; j++) {
++        neighbors(i, j) = candidates[j].second;
++      }
++    }
++  }
++}
++
+ template <typename T>
+ void all_neighbors_graph(raft::resources const& res,
+                          raft::host_matrix_view<const T, int64_t, raft::row_major> dataset,
+                          raft::host_matrix_view<uint32_t, int64_t, raft::row_major> neighbors,
+                          cuvs::distance::DistanceType metric)
+ {
++  // Upper HNSW layers keep ~1/M of the rows of the layer below, so most of them are tiny. Their
++  // exact k-NN graph is cheap on the host (n_rows^2 * dim multiply-adds, capped at ~1.3e8 here),
++  // whereas each NN-descent call pays tens of milliseconds of GPU setup.
++  constexpr double kExactMaxWork = static_cast<double>(1 << 27);
++  if (static_cast<double>(dataset.extent(0)) * static_cast<double>(dataset.extent(0)) *
++        static_cast<double>(dataset.extent(1)) <=
++      kExactMaxWork) {
++    exact_all_neighbors_graph(dataset, neighbors, metric);
++    return;
++  }
+   // FIXME: choose better heuristic
+   bool use_nn_decent = neighbors.size() < 1e7;
+   if (use_nn_decent) {

@@ -1,0 +1,33 @@
+start 00:38:27
+build dir libcuvs.so == base snapshot
+base/percent CTest files differ only in PERCENT
+udf base cold rc=0 wall=58.652735769
+udf base warm rc=0 wall=2.964953201
+udf udf cold rc=0 wall=40.479329342
+udf udf warm rc=0 wall=2.765329292
+udf udf cold rc=0 wall=40.343459577
+udf udf warm rc=0 wall=2.869633210
+udf base cold rc=0 wall=59.678674228
+udf base warm rc=0 wall=3.279103449
+suite base_r1 rc=0 wall=2018.435954159 100% tests passed out of 59
+suite percent_r1 rc=0 wall=1940.229055486 100% tests passed out of 59
+suite percent_r2 rc=0 wall=1937.903706054 100% tests passed out of 59
+suite base_r2 rc=0 wall=1928.077366402 100% tests passed out of 59
+end 02:55:03
+start 05:01:10
+suite tip_warmup rc=0 wall=775.413179189 100% tests passed out of 59
+suite basepct_r1 rc=0 wall=1951.341666437 100% tests passed out of 59
+suite tip_r1 rc=0 wall=774.951771508 100% tests passed out of 59
+suite tip_r2 rc=0 wall=779.220315534 100% tests passed out of 59
+suite basepct_r2 rc=0 wall=1944.679125632 100% tests passed out of 59
+end 06:44:55
+start 06:44:56
+shard 1 cold rc=0 wall=899.286273989 100% tests passed out of 10 cache=350M
+shard 1 warm rc=0 wall=623.274425142 100% tests passed out of 10 cache=350M
+shard 2 cold rc=0 wall=229.715326770 100% tests passed out of 11 cache=70M
+shard 2 warm rc=0 wall=139.872352417 100% tests passed out of 11 cache=70M
+shard 3 cold rc=0 wall=964.122368066 100% tests passed out of 11 cache=219M
+shard 3 warm rc=0 wall=667.135257357 100% tests passed out of 11 cache=219M
+shard 4 cold rc=0 wall=748.237466313 100% tests passed out of 10 cache=175M
+shard 4 warm rc=0 wall=501.811741931 100% tests passed out of 10 cache=175M
+end 08:04:29

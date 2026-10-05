@@ -1,0 +1,210 @@
+diff --git a/cpp/src/neighbors/detail/nn_descent.cuh b/cpp/src/neighbors/detail/nn_descent.cuh
+--- a/cpp/src/neighbors/detail/nn_descent.cuh
++++ b/cpp/src/neighbors/detail/nn_descent.cuh
+@@ -41,6 +41,7 @@
+ 
+ #include <mma.h>
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <limits>
+ #include <numeric>
+@@ -2016,6 +2017,20 @@
+ #endif  // (__CUDA_ARCH__ >= 750)
+ }
+ 
++// The host-side loops over graph rows (sample_graph, sample_graph_new, update_graph, sort_lists,
++// the output copies, ...) cost roughly 0.1-2 us per row on one core, while forking and joining a
++// full OpenMP team costs from a few us (hot team) to milliseconds (oversubscribed host). Give each
++// thread at least MIN_ROWS_PER_OMP_THREAD rows so that small graphs (CAGRA/HNSW-ACE partitions,
++// upper HNSW layers, tests) don't wake every core for a few hundred microseconds of work. Graphs
++// with MIN_ROWS_PER_OMP_THREAD * omp_get_max_threads() rows or more still use the whole team.
++constexpr size_t MIN_ROWS_PER_OMP_THREAD = 256;
++
++inline int omp_threads_for_rows(size_t nrow)
++{
++  const auto max_threads = static_cast<size_t>(std::max(1, cuvs::core::omp::get_max_threads()));
++  return static_cast<int>(std::clamp<size_t>(nrow / MIN_ROWS_PER_OMP_THREAD, 1, max_threads));
++}
++
+ // launch_bounds here denote BLOCK_SIZE = 512 and MIN_BLOCKS_PER_SM = 4
+ // Per
+ // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications,
+@@ -2074,7 +2089,7 @@
+   // immediately after that row is done, so beyond the one-time zero-initialization when each
+   // thread starts, no reset across the full array is ever needed.
+   const size_t num_dedup_words = (nrow + 63) / 64;
+-#pragma omp parallel
++#pragma omp parallel num_threads(omp_threads_for_rows(nrow))
+   {
+     std::vector<uint64_t> seen_bits(num_dedup_words, 0);
+ 
+@@ -2164,7 +2179,7 @@
+ void GnndGraph<Index_t>::sample_graph_new(InternalID_t<Index_t>* new_neighbors, const size_t width)
+ {
+   std::fill_n(h_graph_new.data_handle(), nrow * num_samples, std::numeric_limits<Index_t>::max());
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow))
+   for (size_t i = 0; i < nrow; i++) {
+     auto list_new                       = h_graph_new.data_handle() + i * num_samples;
+     h_list_sizes_new.data_handle()[i].x = 0;
+@@ -2200,7 +2215,7 @@
+       stride++;
+     }
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow))
+     for (uint64_t i = 0; i < nrow; i++) {
+       // Generate a starting index. The node ((i + 1) % nrow) will be included in the neighbor list
+       // of node i. This rule guarantees the connectivity of the graph.
+@@ -2236,7 +2251,7 @@
+     std::fill_n(h_graph_new.data_handle(), nrow * num_samples, std::numeric_limits<Index_t>::max());
+   }
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow))
+   for (size_t i = 0; i < nrow; i++) {
+     h_list_sizes_old.data_handle()[i].x = 0;
+     h_list_sizes_old.data_handle()[i].y = 0;
+@@ -2279,7 +2294,7 @@
+                                       const size_t width,
+                                       std::atomic<int64_t>& update_counter)
+ {
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow))
+   for (size_t i = 0; i < nrow; i++) {
+     for (size_t j = 0; j < width; j++) {
+       auto new_neighb_id = new_neighbors[i * width + j];
+@@ -2299,7 +2314,7 @@
+ template <typename Index_t>
+ void GnndGraph<Index_t>::sort_lists()
+ {
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow))
+   for (size_t i = 0; i < nrow; i++) {
+     std::vector<std::pair<DistData_t, Index_t>> new_list;
+     for (size_t j = 0; j < node_degree; j++) {
+@@ -2730,6 +2745,12 @@
+   graph_.init_random_graph();
+   graph_.sample_graph(true);
+ 
++  // Host half of an iteration. It runs while the GPU executes the same iteration's
++  // add_reverse_edges + local_join, which are only enqueued (asynchronously) beforehand. The two
++  // touch disjoint buffers: this reads graph_host_buffer_/dists_host_buffer_ (the previous
++  // iteration's local_join output) and writes graph_.h_graph, graph_.h_dists, graph_.h_graph_old
++  // and the host list sizes, while the device work reads graph_.h_graph_new and the copies
++  // h_graph_old_/d_list_sizes_*_ that were synchronized before it was enqueued.
+   auto update_and_sample = [&](bool update_graph) {
+     if (update_graph) {
+       update_counter_ = 0;
+@@ -2751,8 +2772,6 @@
+     raft::copy(res, d_list_sizes_old_.view(), graph_.h_list_sizes_old.view());
+     raft::resource::sync_stream(res);
+ 
+-    std::thread update_and_sample_thread(update_and_sample, it);
+-
+     RAFT_LOG_DEBUG("# GNND iteration: %lu / %lu", it + 1, build_config_.max_iterations);
+ 
+     // Reuse dists_buffer_ to save GPU memory. graph_buffer_ cannot be reused, because it
+@@ -2786,7 +2805,10 @@
+       THROW("NN_DESCENT cannot be run for __CUDA_ARCH__ < 700");
+     }
+ 
+-    update_and_sample_thread.join();
++    // Overlaps with the device work enqueued above. Running it on this thread, rather than on a new
++    // std::thread per iteration, avoids a thread spawn/join and a second OpenMP thread pool
++    // competing with this thread's pool for the same cores on every iteration.
++    update_and_sample(it > 0);
+ 
+     if (update_counter_ == -1) { break; }
+     raft::copy(res, graph_host_buffer_.view(), graph_buffer_.view());
+@@ -2811,7 +2833,7 @@
+       nrow_, build_config_.output_graph_degree);
+ 
+ // slice on host
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow_))
+     for (size_t i = 0; i < (size_t)nrow_; i++) {
+       for (size_t j = 0; j < build_config_.output_graph_degree; j++) {
+         graph_h_dists(i, j) = graph_.h_dists(i, j);
+@@ -2847,7 +2869,7 @@
+     graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
+   graph_.h_graph = nullptr;
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow_))
+   for (size_t i = 0; i < (size_t)nrow_; i++) {
+     for (size_t j = 0; j < build_config_.node_degree; j++) {
+       output_graph[i * build_config_.node_degree + j] =
+@@ -2876,6 +2898,8 @@
+   graph_.init_random_graph();
+   graph_.sample_graph(true);
+ 
++  // Host half of an iteration; see the non-BBQ build() above for why it can overlap with the
++  // device work of the same iteration.
+   auto update_and_sample = [&](bool update_graph) {
+     if (update_graph) {
+       update_counter_ = 0;
+@@ -2897,7 +2921,6 @@
+     raft::copy(res, d_list_sizes_old_.view(), graph_.h_list_sizes_old.view());
+     raft::resource::sync_stream(res);
+ 
+-    std::thread update_and_sample_thread(update_and_sample, it);
+     RAFT_LOG_DEBUG("# GNND iteration: %lu / %lu", it + 1, build_config_.max_iterations);
+ 
+     static_assert(DEGREE_ON_DEVICE * sizeof(*(dists_buffer_.data_handle())) >=
+@@ -2914,7 +2937,8 @@
+                       stream);
+ 
+     local_join(stream, dataset, dist_epilogue);
+-    update_and_sample_thread.join();
++    // Overlaps with the device work enqueued above (inline, not on a per-iteration std::thread).
++    update_and_sample(it > 0);
+     if (update_counter_ == -1) { break; }
+     raft::copy(res, graph_host_buffer_.view(), graph_buffer_.view());
+     raft::copy(res, dists_host_buffer_.view(), dists_buffer_.view());
+@@ -2933,7 +2957,7 @@
+   if (return_distances) {
+     auto graph_h_dists = raft::make_host_matrix<DistData_t, int64_t, raft::row_major>(
+       nrow_, build_config_.output_graph_degree);
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow_))
+     for (size_t i = 0; i < nrow_; ++i) {
+       for (size_t j = 0; j < build_config_.output_graph_degree; ++j) {
+         graph_h_dists(i, j) = graph_.h_dists(i, j);
+@@ -2967,7 +2991,7 @@
+     graph_shrink_buffer, graph_.h_graph, nrow_, graph_.node_degree, build_config_.node_degree);
+   graph_.h_graph = nullptr;
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(nrow_))
+   for (size_t i = 0; i < nrow_; ++i) {
+     for (size_t j = 0; j < build_config_.node_degree; ++j) {
+       output_graph[i * build_config_.node_degree + j] =
+@@ -3045,7 +3069,7 @@
+       "distance view to be allocated.");
+   }
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(static_cast<size_t>(dataset.n_rows())))
+   for (size_t i = 0; i < static_cast<size_t>(dataset.n_rows()); ++i) {
+     for (size_t j = 0; j < graph_degree; ++j) {
+       idx.graph()(i, j) = int_graph(i, j);
+@@ -3077,7 +3101,7 @@
+   // When the graph will be a complete graph, output it without NND process for better performance.
+   if (static_cast<size_t>(dataset.extent(0) - 1) == graph_degree && (!params.return_distances)) {
+     auto graph = idx.graph().data_handle();
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(static_cast<size_t>(dataset.extent(0))))
+     for (size_t i = 0; i < static_cast<size_t>(dataset.extent(0)); i++) {
+       for (size_t j = 0; j < graph_degree; j++) {
+         graph[i * graph_degree + j] = (i + j + 1) % dataset.extent(0);
+@@ -3102,7 +3126,7 @@
+                  "distance view to be allocated.");
+   }
+ 
+-#pragma omp parallel for
++#pragma omp parallel for num_threads(omp_threads_for_rows(static_cast<size_t>(dataset.extent(0))))
+   for (size_t i = 0; i < static_cast<size_t>(dataset.extent(0)); i++) {
+     for (size_t j = 0; j < graph_degree; j++) {
+       auto graph                  = idx.graph().data_handle();

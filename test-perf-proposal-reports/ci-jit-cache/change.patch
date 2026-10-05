@@ -1,0 +1,51 @@
+diff --git a/.github/workflows/pr.yaml b/.github/workflows/pr.yaml
+index 0ad4de8e..1ff5ee62 100644
+--- a/.github/workflows/pr.yaml
++++ b/.github/workflows/pr.yaml
+@@ -497,7 +497,9 @@ jobs:
+       build_type: pull-request
+       script: "ci/test_cpp.sh ${{ matrix.shard }} ${{ matrix.num_shards }}"
+       cache-paths: .cache/cuda-jit
+-      cache-key-prefix: libcuvs-cudajit-v1
++      # One cache per test shard: each shard links a different set of kernels, and with a shared key
++      # only the first shard to finish could save its archive.
++      cache-key-prefix: libcuvs-cudajit-v1-shard${{ matrix.shard }}of${{ matrix.num_shards }}
+       # Caches are immutable. Re-key when the JIT-relevant sources change so a completed run can
+       # save newly compiled entries; restore a compatible earlier archive first.
+       cache-key-files: |
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 2e206ba4..0db5e524 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -62,7 +62,9 @@ jobs:
+       script: "ci/test_cpp.sh ${{ matrix.shard }} ${{ matrix.num_shards }}"
+       sha: ${{ inputs.sha }}
+       cache-paths: .cache/cuda-jit
+-      cache-key-prefix: libcuvs-cudajit-v1
++      # One cache per test shard: each shard links a different set of kernels, and with a shared key
++      # only the first shard to finish could save its archive.
++      cache-key-prefix: libcuvs-cudajit-v1-shard${{ matrix.shard }}of${{ matrix.num_shards }}
+       # Caches are immutable. Re-key when the JIT-relevant sources change so a completed run can
+       # save newly compiled entries; restore a compatible earlier archive first.
+       cache-key-files: |
+diff --git a/ci/test_cpp.sh b/ci/test_cpp.sh
+index 84745e83..87b4c3b4 100755
+--- a/ci/test_cpp.sh
++++ b/ci/test_cpp.sh
+@@ -43,6 +43,7 @@ if [[ "${CUDA_CACHE_PATH}" != /* ]]; then
+ fi
+ export CUDA_CACHE_PATH
+ mkdir -p "${CUDA_CACHE_PATH}"
++rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files before the tests"
+ 
+ rapids-print-env
+ 
+@@ -82,5 +83,8 @@ if [[ "${SHARD}" == "1" && "${KVIKIO_COMPAT_MODE}" == "ON" ]]; then
+ fi
+ popd
+ 
++# Every kernel that was not in the restored cache and had to be linked adds files.
++rapids-logger "CUDA JIT cache ${CUDA_CACHE_PATH}: $(find "${CUDA_CACHE_PATH}" -type f | wc -l) files ($(du -sh "${CUDA_CACHE_PATH}" | cut -f1)) after the tests"
++
+ rapids-logger "Test script exiting with value: $EXITCODE"
+ exit ${EXITCODE}

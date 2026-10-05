@@ -1,0 +1,334 @@
+--- a/cpp/tests/neighbors/ann_ivf_flat.cuh
++++ b/cpp/tests/neighbors/ann_ivf_flat.cuh
+@@ -14,12 +14,12 @@
+ #include <cuvs/neighbors/ivf_flat.hpp>
+ #include <raft/linalg/normalize.cuh>
+ #include <raft/stats/mean.cuh>
+-#include <thrust/reduce.h>
+ 
+ #include <raft/core/resource/cuda_stream_pool.hpp>
+ #include <raft/linalg/add.cuh>
+ #include <raft/matrix/gather.cuh>
+ #include <raft/util/fast_int_div.cuh>
++#include <raft/util/pow2_utils.cuh>
+ #include <rmm/cuda_stream_pool.hpp>
+ 
+ #include <algorithm>
+@@ -33,6 +33,51 @@
+   static constexpr unsigned offset = 300;
+ };
+ 
++template <typename Pred>
++RAFT_KERNEL count_if_kernel(uint32_t n, Pred pred, uint32_t* count)
++{
++  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
++  // All threads of the block must take part, including those past the end.
++  auto n_true = __syncthreads_count(i < n && pred(i));
++  if (threadIdx.x == 0 && n_true > 0) { atomicAdd(count, static_cast<uint32_t>(n_true)); }
++}
++
++/**
++ * Adds to `*count` (in device memory) the number of `i < n` for which `pred(i)` holds. It does not
++ * synchronize the stream, so many counts can be read back with a single copy.
++ */
++template <typename Pred>
++void count_if_async(const raft::resources& res, uint32_t n, Pred pred, uint32_t* count)
++{
++  if (n == 0) { return; }
++  constexpr uint32_t kBlockSize = 256;
++  count_if_kernel<<<raft::ceildiv(n, kBlockSize),
++                    kBlockSize,
++                    0,
++                    raft::resource::get_cuda_stream(res).get()>>>(n, pred, count);
++  RAFT_CUDA_TRY(cudaPeekAtLastError());
++}
++
++/**
++ * Whether the element `i` of the data of an interleaved list of `list_size` rows of `dim`
++ * components holds a component of a row, rather than padding.
++ */
++struct interleaved_list_mask {
++  uint32_t dim;
++  uint32_t list_size;
++  raft::util::FastIntDiv<int32_t> chunk_size;  // veclen
++
++  __device__ auto operator()(uint32_t i) const -> bool
++  {
++    using interleaved_group   = raft::Pow2<kIndexGroupSize>;
++    uint32_t max_group_offset = interleaved_group::roundDown(list_size);
++    if (i < max_group_offset * dim) { return true; }
++    uint32_t surplus    = (i - max_group_offset * dim);
++    uint32_t ingroup_id = interleaved_group::mod(static_cast<int32_t>(surplus) / chunk_size);
++    return ingroup_id < (list_size - max_group_offset);
++  }
++};
++
+ template <typename IdxT>
+ struct AnnIvfFlatInputs {
+   IdxT num_queries;
+@@ -241,17 +286,19 @@
+ 
+     // Test the centroid invariants
+     if (index_2.adaptive_centers()) {
+-      // The centers must be up-to-date with the corresponding data
++      // The centers must be up-to-date with the corresponding data. The mean of each list is
++      // computed on the device, and all of them are compared with the centers at once.
+       std::vector<uint32_t> list_sizes(index_2.n_lists());
+       std::vector<IdxT*> list_indices(index_2.n_lists());
+-      rmm::device_uvector<float> centroid(ps.dim, stream_);
+       raft::copy(list_sizes.data(), index_2.list_sizes().data_handle(), index_2.n_lists(), stream_);
+       raft::copy(
+         list_indices.data(), index_2.inds_ptrs().data_handle(), index_2.n_lists(), stream_);
+       raft::resource::sync_stream(handle_);
++      uint32_t max_list_size = *std::max_element(list_sizes.begin(), list_sizes.end());
++      rmm::device_uvector<float> cluster_data(size_t{max_list_size} * ps.dim, stream_);
++      rmm::device_uvector<float> centroids(size_t{index_2.n_lists()} * ps.dim, stream_);
+       for (uint32_t l = 0; l < index_2.n_lists(); l++) {
+         if (list_sizes[l] == 0) continue;
+-        rmm::device_uvector<float> cluster_data(list_sizes[l] * ps.dim, stream_);
+         cuvs::spatial::knn::detail::utils::copy_selected<float>((IdxT)list_sizes[l],
+                                                                 (IdxT)ps.dim,
+                                                                 database.data(),
+@@ -260,13 +307,29 @@
+                                                                 cluster_data.data(),
+                                                                 (IdxT)ps.dim,
+                                                                 stream_);
+-        raft::stats::mean<true, float, uint32_t>(
+-          centroid.data(), cluster_data.data(), ps.dim, list_sizes[l], false, stream_.get());
+-        ASSERT_TRUE(cuvs::devArrMatch(index_2.centers().data_handle() + ps.dim * l,
+-                                      centroid.data(),
+-                                      ps.dim,
+-                                      cuvs::CompareApprox<float>(0.001),
+-                                      stream_.get()));
++        raft::stats::mean<true, float, uint32_t>(centroids.data() + ps.dim * l,
++                                                 cluster_data.data(),
++                                                 ps.dim,
++                                                 list_sizes[l],
++                                                 false,
++                                                 stream_.get());
++      }
++      std::vector<float> centers_host(centroids.size());
++      std::vector<float> centroids_host(centroids.size());
++      raft::copy(
++        centers_host.data(), index_2.centers().data_handle(), centers_host.size(), stream_);
++      raft::copy(centroids_host.data(), centroids.data(), centroids_host.size(), stream_);
++      raft::resource::sync_stream(handle_);
++      cuvs::CompareApprox<float> eq_compare(0.001);
++      for (uint32_t l = 0; l < index_2.n_lists(); l++) {
++        if (list_sizes[l] == 0) continue;
++        for (IdxT j = 0; j < ps.dim; j++) {
++          float expected = centers_host[ps.dim * l + j];
++          float actual   = centroids_host[ps.dim * l + j];
++          ASSERT_TRUE(eq_compare(expected, actual))
++            << "actual=" << actual << " != expected=" << expected << " @" << j << " (list " << l
++            << ")";
++        }
+       }
+     } else {
+       // The centers must be immutable
+@@ -332,6 +395,21 @@
+ 
+     using interleaved_group = raft::Pow2<kIndexGroupSize>;
+ 
++    // The checks of all lists are counted on the device and read back at once after the loop, so
++    // that the loop does not synchronize the stream. Per list: the number of elements of the
++    // interleaved data that hold a component of a row (`kMasked`), and the numbers of mismatches of
++    // the packed data (`kPackMismatches`) and of the unpacked rows (`kUnpackMismatches`).
++    enum : uint32_t { kMasked = 0, kPackMismatches, kUnpackMismatches, kNumCounts };
++    auto counts = raft::make_device_matrix<uint32_t, uint32_t>(handle_, idx.n_lists(), kNumCounts);
++    RAFT_CUDA_TRY(
++      cudaMemsetAsync(counts.data_handle(), 0, counts.size() * sizeof(uint32_t), stream_.get()));
++
++    uint32_t max_list_size =
++      *std::max_element(list_sizes.data_handle(), list_sizes.data_handle() + list_sizes.extent(0));
++    auto flat_codes = raft::make_device_matrix<DataT, uint32_t>(handle_, max_list_size, idx.dim());
++    auto unpacked_flat_codes =
++      raft::make_device_matrix<DataT, uint32_t>(handle_, max_list_size, idx.dim());
++
+     for (uint32_t label = 0; label < idx.n_lists(); label++) {
+       uint32_t list_size = list_sizes.data_handle()[label];
+ 
+@@ -340,9 +418,11 @@
+         uint32_t n_elems          = padded_list_size * idx.dim();
+         auto& list_data           = lists[label]->data;
+         auto& list_inds           = extend_index.lists()[label]->indices;
++        auto* list_counts         = counts.data_handle() + label * kNumCounts;
+ 
+         // fetch the flat codes
+-        auto flat_codes = raft::make_device_matrix<DataT, uint32_t>(handle_, list_size, idx.dim());
++        auto flat_codes_view = raft::make_device_matrix_view<DataT, uint32_t>(
++          flat_codes.data_handle(), list_size, idx.dim());
+ 
+         raft::matrix::gather(
+           handle_,
+@@ -350,75 +430,64 @@
+             (const DataT*)database.data(), static_cast<uint32_t>(ps.num_db_vecs), idx.dim()),
+           raft::make_device_vector_view<const IdxT, uint32_t>((const IdxT*)list_inds.data_handle(),
+                                                               list_size),
+-          flat_codes.view());
++          flat_codes_view);
+ 
+         helpers::codepacker::pack(
+-          handle_, make_const_mdspan(flat_codes.view()), idx.veclen(), 0, list_data.view());
+-
+-        {
+-          auto mask = raft::make_device_vector<bool>(handle_, n_elems);
++          handle_, make_const_mdspan(flat_codes_view), idx.veclen(), 0, list_data.view());
+ 
+-          raft::linalg::map_offset(
+-            handle_,
+-            mask.view(),
+-            [dim = idx.dim(),
+-             list_size,
+-             padded_list_size,
+-             chunk_size = raft::util::FastIntDiv<int32_t>(
+-               static_cast<int32_t>(idx.veclen()))] __device__(auto i) {
+-              uint32_t max_group_offset = interleaved_group::roundDown(list_size);
+-              if (i < max_group_offset * dim) { return true; }
+-              uint32_t surplus = (i - max_group_offset * dim);
+-              uint32_t ingroup_id =
+-                interleaved_group::mod(static_cast<int32_t>(surplus) / chunk_size);
+-              return ingroup_id < (list_size - max_group_offset);
+-            });
+-
+-          // ensure that the correct number of indices are masked out
+-          ASSERT_TRUE(thrust::reduce(raft::resource::get_thrust_policy(handle_),
+-                                     mask.data_handle(),
+-                                     mask.data_handle() + n_elems,
+-                                     0) == list_size * ps.dim);
+-
+-          auto packed_list_data = raft::make_device_vector<DataT, uint32_t>(handle_, n_elems);
+-
+-          raft::linalg::map_offset(handle_,
+-                                   packed_list_data.view(),
+-                                   [mask      = mask.data_handle(),
+-                                    list_data = list_data.data_handle()] __device__(uint32_t i) {
+-                                     if (mask[i]) return list_data[i];
+-                                     return DataT{0};
+-                                   });
+-
+-          auto& extend_data         = extend_index.lists()[label]->data;
+-          auto extend_data_filtered = raft::make_device_vector<DataT, uint32_t>(handle_, n_elems);
+-          raft::linalg::map_offset(
+-            handle_,
+-            extend_data_filtered.view(),
+-            [mask        = mask.data_handle(),
+-             extend_data = extend_data.data_handle()] __device__(uint32_t i) {
+-              if (mask[i]) return extend_data[i];
+-              return DataT{0};
+-            });
+-
+-          ASSERT_TRUE(cuvs::devArrMatch(packed_list_data.data_handle(),
+-                                        extend_data_filtered.data_handle(),
+-                                        n_elems,
+-                                        cuvs::Compare<DataT>(),
+-                                        stream_.get()));
+-        }
++        interleaved_list_mask mask{
++          idx.dim(),
++          list_size,
++          raft::util::FastIntDiv<int32_t>(static_cast<int32_t>(idx.veclen()))};
++
++        // ensure that the correct number of indices are masked out
++        count_if_async(handle_, n_elems, mask, list_counts + kMasked);
++
++        // The packed data must match the data of the list built by `extend` where the mask is set.
++        // (The padding is not compared.)
++        auto& extend_data = extend_index.lists()[label]->data;
++        count_if_async(
++          handle_,
++          n_elems,
++          [mask,
++           list_data   = list_data.data_handle(),
++           extend_data = extend_data.data_handle()] __device__(uint32_t i) {
++            return mask(i) && !(list_data[i] == extend_data[i]);
++          },
++          list_counts + kPackMismatches);
+ 
+-        auto unpacked_flat_codes =
+-          raft::make_device_matrix<DataT, uint32_t>(handle_, list_size, idx.dim());
++        auto unpacked_flat_codes_view = raft::make_device_matrix_view<DataT, uint32_t>(
++          unpacked_flat_codes.data_handle(), list_size, idx.dim());
+ 
+         helpers::codepacker::unpack(
+-          handle_, list_data.view(), idx.veclen(), 0, unpacked_flat_codes.view());
++          handle_, list_data.view(), idx.veclen(), 0, unpacked_flat_codes_view);
++
++        // The unpacked rows must match the flat codes that were packed.
++        count_if_async(
++          handle_,
++          list_size * idx.dim(),
++          [flat_codes          = flat_codes_view.data_handle(),
++           unpacked_flat_codes = unpacked_flat_codes_view.data_handle()] __device__(uint32_t i) {
++            return !(flat_codes[i] == unpacked_flat_codes[i]);
++          },
++          list_counts + kUnpackMismatches);
++      }
++    }
++
++    auto counts_host = raft::make_host_matrix<uint32_t, uint32_t>(idx.n_lists(), kNumCounts);
++    raft::copy(counts_host.data_handle(), counts.data_handle(), counts.size(), stream_);
++    raft::resource::sync_stream(handle_);
+ 
+-        ASSERT_TRUE(cuvs::devArrMatch(flat_codes.data_handle(),
+-                                      unpacked_flat_codes.data_handle(),
+-                                      list_size * ps.dim,
+-                                      cuvs::Compare<DataT>(),
+-                                      stream_.get()));
++    for (uint32_t label = 0; label < idx.n_lists(); label++) {
++      uint32_t list_size = list_sizes.data_handle()[label];
++
++      if (list_size > 0) {
++        ASSERT_EQ(uint64_t{counts_host(label, kMasked)}, uint64_t{list_size} * uint64_t(ps.dim))
++          << "wrong number of masked elements in list " << label;
++        ASSERT_EQ(counts_host(label, kPackMismatches), 0u)
++          << "packed data of list " << label << " differs from the data added with extend";
++        ASSERT_EQ(counts_host(label, kUnpackMismatches), 0u)
++          << "unpacked rows of list " << label << " differ from the rows that were packed";
+       }
+     }
+   }
+--- a/cpp/tests/neighbors/ann_ivf_pq.cuh
++++ b/cpp/tests/neighbors/ann_ivf_pq.cuh
+@@ -16,7 +16,6 @@
+ #include <raft/linalg/add.cuh>
+ #include <raft/matrix/gather.cuh>
+ #include <rmm/cuda_stream_pool.hpp>
+-#include <rmm/mr/managed_memory_resource.hpp>
+ #include <thrust/sequence.h>
+ 
+ #include <memory>
+@@ -25,6 +24,7 @@
+ #include <typeindex>
+ #include <typeinfo>
+ #include <utility>
++#include <vector>
+ 
+ namespace cuvs::neighbors::ivf_pq {
+ 
+@@ -109,9 +109,7 @@
+ {
+   auto n_rows = a.extent(0);
+   auto dim    = a.extent(1);
+-  rmm::mr::managed_memory_resource managed_memory;
+-  auto dist =
+-    raft::make_device_mdarray<double>(res, managed_memory, raft::make_extents<uint32_t>(n_rows));
++  auto dist   = raft::make_device_vector<double, uint32_t>(res, n_rows);
+   raft::linalg::map_offset(res, dist.view(), [a, b, dim] __device__(uint32_t i) {
+     cuvs::spatial::knn::detail::utils::mapping<float> f{};
+     double d = 0.0f;
+@@ -121,9 +119,13 @@
+     }
+     return sqrt(d / double(dim));
+   });
++  // Copy all distances at once: reading the elements of a device array on the host one by one
++  // copies and synchronizes for each of them.
++  std::vector<double> dist_host(n_rows);
++  raft::copy(dist_host.data(), dist.data_handle(), n_rows, raft::resource::get_cuda_stream(res));
+   raft::resource::sync_stream(res);
+   for (uint32_t i = 0; i < n_rows; i++) {
+-    double d = dist(i);
++    double d = dist_host[i];
+     // The theoretical estimate of the error is hard to come up with,
+     // the estimate below is based on experimentation + curse of dimensionality
+     ASSERT_LE(d, 1.2 * eps * std::pow(2.0, compression_ratio))
