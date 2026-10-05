@@ -17,7 +17,11 @@
 #include <raft/core/resource/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_pool.hpp>
 
+#include <algorithm>
+#include <memory>
 #include <numeric>
+#include <utility>
+#include <vector>
 
 namespace cuvs::neighbors::ivf_sq {
 
@@ -60,24 +64,24 @@ class AnnIVFSQTest : public ::testing::TestWithParam<AnnIvfSqInputs<IdxT>> {
 
   void testAll()
   {
-    auto naive = compute_naive_knn();
-    auto idx   = build_index(true);
+    auto naive   = compute_naive_knn();
+    auto indices = get_indices();
 
     {
       SCOPED_TRACE("Search");
-      checkSearch(idx, naive);
+      checkSearch(indices->built, naive);
     }
     {
       SCOPED_TRACE("Serialize");
-      checkSerialize(idx);
+      checkSerialize(indices->built, indices->loaded);
     }
     {
       SCOPED_TRACE("Filter");
-      checkFilter(idx);
+      checkFilter(indices->built);
     }
     {
       SCOPED_TRACE("Extend");
-      checkExtend(naive);
+      checkExtend(indices->extended, naive);
     }
   }
 
@@ -86,6 +90,47 @@ class AnnIVFSQTest : public ::testing::TestWithParam<AnnIvfSqInputs<IdxT>> {
     std::vector<IdxT> indices;
     std::vector<T> distances;
   };
+
+  /**
+   * Everything that determines the indices of a case. SetUp draws the database first from a fixed
+   * seed, so it depends only on (num_db_vecs, dim); the data type is fixed per fixture
+   * instantiation, each of which has its own cache. The remaining parameters (num_queries, k,
+   * nprobe) only affect the queries and the searches. Extend this key when adding inputs that
+   * affect the database or the index parameters.
+   */
+  struct index_key {
+    IdxT num_db_vecs;
+    IdxT dim;
+    IdxT nlist;
+    cuvs::distance::DistanceType metric;
+    bool host_dataset;
+
+    bool operator==(const index_key&) const = default;
+  };
+
+  /** The indices built for one `index_key`. None of them is modified after construction. */
+  struct built_indices {
+    index_key key;
+    /** Keeps the resources the indices were allocated with alive while they are cached. */
+    raft::resources res;
+    /** `build` with `add_data_on_build = true`. */
+    cuvs::neighbors::ivf_sq::index<uint8_t> built;
+    /** `built` after a `serialize` / `deserialize` round trip. */
+    cuvs::neighbors::ivf_sq::index<uint8_t> loaded;
+    /** An empty index with the quantizer of `built`, filled with `extend`. */
+    cuvs::neighbors::ivf_sq::index<uint8_t> extended;
+    size_t device_bytes;
+  };
+
+  /**
+   * Least-recently-used cache of indices shared by the cases of one test suite, so cases that
+   * differ only in the search parameters do not rebuild them. The device memory held by the cache
+   * is bounded by kIndexCacheBytes; it is released in TearDownTestSuite.
+   */
+  static constexpr size_t kIndexCacheBytes = size_t{128} << 20;
+  inline static std::vector<std::shared_ptr<const built_indices>> index_cache_;
+
+  static void TearDownTestSuite() { index_cache_.clear(); }
 
   void checkSearch(const cuvs::neighbors::ivf_sq::index<uint8_t>& idx, const SearchResults& naive)
   {
@@ -102,13 +147,9 @@ class AnnIVFSQTest : public ::testing::TestWithParam<AnnIvfSqInputs<IdxT>> {
                                 min_recall_threshold()));
   }
 
-  void checkSerialize(const cuvs::neighbors::ivf_sq::index<uint8_t>& idx)
+  void checkSerialize(const cuvs::neighbors::ivf_sq::index<uint8_t>& idx,
+                      const cuvs::neighbors::ivf_sq::index<uint8_t>& index_loaded)
   {
-    tmp_index_file index_file;
-    cuvs::neighbors::ivf_sq::serialize(handle_, index_file.filename, idx);
-    cuvs::neighbors::ivf_sq::index<uint8_t> index_loaded(handle_);
-    cuvs::neighbors::ivf_sq::deserialize(handle_, index_file.filename, &index_loaded);
-
     ASSERT_EQ(idx.size(), index_loaded.size());
     ASSERT_EQ(idx.dim(), index_loaded.dim());
     ASSERT_EQ(idx.n_lists(), index_loaded.n_lists());
@@ -127,12 +168,10 @@ class AnnIVFSQTest : public ::testing::TestWithParam<AnnIvfSqInputs<IdxT>> {
                                 1.0));
   }
 
-  void checkExtend(const SearchResults& naive)
+  void checkExtend(const cuvs::neighbors::ivf_sq::index<uint8_t>& idx_extended,
+                   const SearchResults& naive)
   {
-    auto idx_empty = build_index(false);
-    extend_index(&idx_empty);
-
-    auto results = search_index(idx_empty);
+    auto results = search_index(idx_extended);
 
     float eps = 0.1;
     ASSERT_TRUE(eval_neighbours(naive.indices,
@@ -286,13 +325,92 @@ class AnnIVFSQTest : public ::testing::TestWithParam<AnnIvfSqInputs<IdxT>> {
     return results;
   }
 
-  cuvs::neighbors::ivf_sq::index<uint8_t> build_index(bool add_data_on_build)
+  cuvs::neighbors::ivf_sq::index_params make_index_params(bool add_data_on_build)
   {
     cuvs::neighbors::ivf_sq::index_params index_params;
     index_params.n_lists                      = ps.nlist;
     index_params.metric                       = ps.metric;
     index_params.add_data_on_build            = add_data_on_build;
     index_params.max_train_points_per_cluster = 256;
+    return index_params;
+  }
+
+  static size_t device_bytes(const cuvs::neighbors::ivf_sq::index<uint8_t>& idx)
+  {
+    size_t bytes = idx.centers().size() * sizeof(float);
+    for (const auto& list : idx.lists()) {
+      if (list) { bytes += list->data_byte_size() + list->indices_capacity() * sizeof(int64_t); }
+    }
+    return bytes;
+  }
+
+  /** Returns the indices for the current case, from the cache if possible. */
+  std::shared_ptr<const built_indices> get_indices()
+  {
+    const index_key key{ps.num_db_vecs, ps.dim, ps.nlist, ps.metric, ps.host_dataset};
+    auto it = std::find_if(index_cache_.begin(), index_cache_.end(), [&key](const auto& entry) {
+      return entry->key == key;
+    });
+    if (it != index_cache_.end()) {
+      auto entry = *it;
+      index_cache_.erase(it);
+      index_cache_.push_back(entry);
+      return entry;
+    }
+
+    auto entry = build_indices(key);
+    if (entry->device_bytes <= kIndexCacheBytes) {
+      size_t cached_bytes = entry->device_bytes;
+      for (const auto& e : index_cache_) {
+        cached_bytes += e->device_bytes;
+      }
+      while (cached_bytes > kIndexCacheBytes) {
+        cached_bytes -= index_cache_.front()->device_bytes;
+        index_cache_.erase(index_cache_.begin());
+      }
+      index_cache_.push_back(entry);
+    }
+    return entry;
+  }
+
+  std::shared_ptr<const built_indices> build_indices(const index_key& key)
+  {
+    auto built = build_index(true);
+
+    cuvs::neighbors::ivf_sq::index<uint8_t> loaded(handle_);
+    {
+      tmp_index_file index_file;
+      cuvs::neighbors::ivf_sq::serialize(handle_, index_file.filename, built);
+      cuvs::neighbors::ivf_sq::deserialize(handle_, index_file.filename, &loaded);
+    }
+
+    // `build` with `add_data_on_build = false` would repeat the training of `built` on the same
+    // data. Instead, copy its trained quantizer into an empty index, created with the same
+    // constructor `build` uses, and fill that with `extend` (which computes the center norms).
+    cuvs::neighbors::ivf_sq::index<uint8_t> extended(handle_, make_index_params(false), ps.dim);
+    raft::copy(extended.centers().data_handle(),
+               built.centers().data_handle(),
+               built.centers().size(),
+               stream_);
+    raft::copy(extended.sq_vmin().data_handle(),
+               built.sq_vmin().data_handle(),
+               built.sq_vmin().size(),
+               stream_);
+    raft::copy(extended.sq_delta().data_handle(),
+               built.sq_delta().data_handle(),
+               built.sq_delta().size(),
+               stream_);
+    extend_index(&extended);
+    raft::resource::sync_stream(handle_);
+
+    auto bytes = device_bytes(built) + device_bytes(loaded) + device_bytes(extended);
+    return std::shared_ptr<const built_indices>(new built_indices{
+      key, handle_, std::move(built), std::move(loaded), std::move(extended), bytes});
+  }
+
+  cuvs::neighbors::ivf_sq::index<uint8_t> build_index(bool add_data_on_build)
+  {
+    auto index_params = make_index_params(add_data_on_build);
 
     if (!ps.host_dataset) {
       auto database_view = raft::make_device_matrix_view<const DataT, IdxT>(
@@ -446,7 +564,7 @@ const std::vector<AnnIvfSqInputs<int64_t>> inputs = {
   {1000, 10000, 16, 1, 40, 1024, cuvs::distance::DistanceType::CosineExpanded},
   {1000, 10000, 16, 2, 40, 1024, cuvs::distance::DistanceType::L2Expanded},
   {1000, 10000, 16, 5, 40, 1024, cuvs::distance::DistanceType::L2Expanded},
-  {1000, 10000, 16, 10, 40, 1024, cuvs::distance::DistanceType::L2Expanded},
+  // k=10 is covered by the dim=16 L2Expanded case above
   {1000, 10000, 16, 20, 40, 1024, cuvs::distance::DistanceType::L2Expanded},
   {1000, 10000, 16, 20, 40, 1024, cuvs::distance::DistanceType::CosineExpanded},
   {1000, 10000, 16, 50, 100, 1024, cuvs::distance::DistanceType::L2Expanded},
