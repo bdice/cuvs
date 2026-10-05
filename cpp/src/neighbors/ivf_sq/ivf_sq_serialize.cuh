@@ -61,9 +61,12 @@ void serialize(raft::resources const& handle, Output& os, const index<CodeT>& in
   cuvs::util::detail::serialize_mdspan(handle, os, sizes_host.view());
 
   list_spec<uint32_t, CodeT, int64_t> list_store_spec{index_.dim(), true};
-  for (uint32_t label = 0; label < index_.n_lists(); label++) {
-    ivf::serialize_list(handle, os, index_.lists()[label], list_store_spec, sizes_host(label));
-  }
+  ivf::detail::serialize_lists<list_data<CodeT, int64_t>>(
+    handle,
+    os,
+    list_store_spec,
+    raft::make_const_mdspan(sizes_host.view()),
+    [&index_](uint32_t label) { return index_.lists()[label].get(); });
   raft::resource::sync_stream(handle);
 }
 
@@ -137,9 +140,15 @@ auto deserialize_impl(raft::resources const& handle, Input& input) -> index<Code
 
   list_spec<uint32_t, CodeT, int64_t> list_device_spec{index_.dim(), cma};
   list_spec<uint32_t, CodeT, int64_t> list_store_spec{index_.dim(), true};
-  for (uint32_t label = 0; label < index_.n_lists(); label++) {
-    ivf::deserialize_list(handle, input, index_.lists()[label], list_store_spec, list_device_spec);
-  }
+  ivf::detail::deserialize_lists<list_data<CodeT, int64_t>>(
+    handle,
+    input,
+    list_store_spec,
+    list_device_spec,
+    raft::make_const_mdspan(index_.list_sizes()),
+    [&index_](uint32_t label, std::shared_ptr<list_data<CodeT, int64_t>> list) {
+      index_.lists()[label] = std::move(list);
+    });
   raft::resource::sync_stream(handle);
 
   ivf::detail::recompute_internal_state(handle, index_);

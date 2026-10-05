@@ -15,21 +15,33 @@
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/mdspan.hpp>
+#include <raft/core/pinned_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resource/thrust_policy.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/core/serialize.hpp>
 #include <raft/matrix/init.cuh>
+#include <raft/util/cudart_utils.hpp>
 #include <raft/util/integer_utils.hpp>
 
 #include "../util/kvikio_serialize.hpp"
 #include "ivf_common.cuh"
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 #include <fstream>
+#include <ios>
+#include <istream>
 #include <limits>
 #include <memory>
+#include <ostream>
+#include <sstream>
+#include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 namespace cuvs::neighbors::ivf {
 
@@ -220,4 +232,350 @@ enable_if_valid_list_t<ListT> deserialize_list(const raft::resources& handle,
   cuvs::util::detail::deserialize_device_mdspan(handle, reader, data_view);
   cuvs::util::detail::deserialize_device_mdspan(handle, reader, indices_view);
 }
+
+namespace detail {
+
+/**
+ * Lists whose payload (data + indices) is larger than this are transferred one at a time by
+ * serialize_list / deserialize_list, which hand the device pointers to KvikIO (GPUDirect Storage
+ * when available). The payloads of smaller lists are batched through a pinned host buffer.
+ */
+inline constexpr size_t kListDirectIoBytes = size_t{4} << 20;
+
+/** Upper bound of the pinned host buffer used to batch the transfers of the smaller lists. */
+inline constexpr size_t kListStagingBytes = cuvs::util::detail::kDeviceSerializationBatchBytes;
+
+constexpr auto mul_saturated(size_t a, size_t b) noexcept -> size_t
+{
+  return (b != 0 && a > std::numeric_limits<size_t>::max() / b) ? std::numeric_limits<size_t>::max()
+                                                                : a * b;
+}
+
+/**
+ * Bytes of one list record, in the order serialize_list writes them:
+ * [head][data payload][mid][indices payload], where `head` is the numpy scalar holding the list
+ * size followed (for a non-empty list) by the numpy header of the data, and `mid` is the numpy
+ * header of the indices (empty for an empty list).
+ */
+struct list_record_layout {
+  std::string head;
+  std::string mid;
+  size_t data_bytes    = 0;
+  size_t indices_bytes = 0;
+
+  [[nodiscard]] auto payload_bytes() const noexcept -> size_t
+  {
+    return data_bytes > std::numeric_limits<size_t>::max() - indices_bytes
+             ? std::numeric_limits<size_t>::max()
+             : data_bytes + indices_bytes;
+  }
+  /** Whether the list is transferred through the staging buffer (otherwise: one at a time). */
+  [[nodiscard]] auto staged() const noexcept -> bool
+  {
+    return payload_bytes() <= kListDirectIoBytes;
+  }
+  /** Size of the whole record; only meaningful for staged lists. */
+  [[nodiscard]] auto record_bytes() const noexcept -> size_t
+  {
+    return head.size() + mid.size() + payload_bytes();
+  }
+};
+
+/**
+ * Formats list records exactly as serialize_list does (same numpy writers, same shapes), caching
+ * the result by list size. The number of distinct sizes is small in practice: d distinct sizes
+ * need at least d * (d - 1) / 2 records in the index.
+ */
+template <typename ListT>
+class list_record_layouts {
+ public:
+  using size_type  = typename ListT::size_type;
+  using value_type = typename ListT::value_type;
+  using index_type = typename ListT::index_type;
+
+  list_record_layouts(const raft::resources& res, const typename ListT::spec_type& store_spec)
+    : res_{res}, store_spec_{store_spec}
+  {
+  }
+
+  /** The returned reference stays valid for the lifetime of this object. */
+  auto operator()(size_type size) -> const list_record_layout&
+  {
+    auto it = cache_.find(size);
+    if (it == cache_.end()) { it = cache_.emplace(size, make_layout(size)).first; }
+    return it->second;
+  }
+
+ private:
+  [[nodiscard]] auto make_layout(size_type size) const -> list_record_layout
+  {
+    list_record_layout layout;
+    std::ostringstream head;
+    raft::serialize_scalar(res_, head, size);
+    if (size > 0) {
+      const auto extents = store_spec_.make_list_extents(size);
+      std::vector<size_t> shape;
+      shape.reserve(extents.rank());
+      size_t n_elements = 1;
+      for (size_t i = 0; i < extents.rank(); ++i) {
+        shape.push_back(static_cast<size_t>(extents.extent(i)));
+        n_elements = mul_saturated(n_elements, shape.back());
+      }
+      cuvs::util::detail::write_numpy_header<value_type>(head, shape);
+      std::ostringstream mid;
+      cuvs::util::detail::write_numpy_header<index_type>(mid, {static_cast<size_t>(size)});
+      layout.mid           = mid.str();
+      layout.data_bytes    = mul_saturated(n_elements, sizeof(value_type));
+      layout.indices_bytes = static_cast<size_t>(size) * sizeof(index_type);
+    }
+    layout.head = head.str();
+    return layout;
+  }
+
+  const raft::resources& res_;
+  typename ListT::spec_type store_spec_;
+  std::unordered_map<size_type, list_record_layout> cache_;
+};
+
+/** Waits for the stream when leaving the scope, so that no async copy outlives its host buffer. */
+class sync_stream_on_exit {
+ public:
+  explicit sync_stream_on_exit(cudaStream_t stream) : stream_{stream} {}
+  ~sync_stream_on_exit() { (void)cudaStreamSynchronize(stream_); }
+  sync_stream_on_exit(const sync_stream_on_exit&)            = delete;
+  sync_stream_on_exit& operator=(const sync_stream_on_exit&) = delete;
+  sync_stream_on_exit(sync_stream_on_exit&&)                 = delete;
+  sync_stream_on_exit& operator=(sync_stream_on_exit&&)      = delete;
+
+ private:
+  cudaStream_t stream_;
+};
+
+/**
+ * Serialize all lists of an index, in order. The output is byte-for-byte the same as calling
+ * `serialize_list(handle, os, list, store_spec, sizes(label))` for every non-null list and writing
+ * an empty list for every null one.
+ *
+ * The payloads of consecutive lists are copied into a pinned host buffer (at most
+ * kListStagingBytes) with one stream synchronization per batch, and then passed to the stream as
+ * plain writes, which a kvikio_ofstream coalesces into a few large writes. Lists with a payload
+ * larger than kListDirectIoBytes still go through serialize_list.
+ *
+ * @param list_at callable `(uint32_t label) -> const ListT*`; nullptr denotes a missing list.
+ */
+template <typename ListT, typename ListAccessor>
+void serialize_lists(const raft::resources& handle,
+                     std::ostream& os,
+                     const typename ListT::spec_type& store_spec,
+                     raft::host_vector_view<const uint32_t, uint32_t> sizes,
+                     ListAccessor&& list_at)
+{
+  using size_type     = typename ListT::size_type;
+  const auto n_lists  = sizes.extent(0);
+  cudaStream_t stream = raft::resource::get_cuda_stream(handle).get();
+  auto list_size      = [&](uint32_t label) -> size_type {
+    return list_at(label) != nullptr ? static_cast<size_type>(sizes(label)) : size_type{0};
+  };
+
+  list_record_layouts<ListT> layouts(handle, store_spec);
+  size_t staged_bytes = 0;
+  for (uint32_t label = 0; label < n_lists; label++) {
+    const auto& layout = layouts(list_size(label));
+    if (layout.staged()) { staged_bytes += layout.payload_bytes(); }
+  }
+  auto staging =
+    raft::make_pinned_vector<char, size_t>(handle, std::min(staged_bytes, kListStagingBytes));
+  sync_stream_on_exit sync_guard{stream};
+
+  uint32_t first_unwritten = 0;  // lists [first_unwritten, label) are staged, but not written yet
+  size_t staged            = 0;  // bytes of their payloads in `staging`
+  auto write_staged        = [&](uint32_t end) {
+    if (staged > 0) { raft::resource::sync_stream(handle); }
+    const char* payload = staging.data_handle();
+    for (; first_unwritten < end; first_unwritten++) {
+      const auto& layout = layouts(list_size(first_unwritten));
+      os.write(layout.head.data(), static_cast<std::streamsize>(layout.head.size()));
+      if (layout.payload_bytes() == 0) { continue; }
+      os.write(payload, static_cast<std::streamsize>(layout.data_bytes));
+      payload += layout.data_bytes;
+      os.write(layout.mid.data(), static_cast<std::streamsize>(layout.mid.size()));
+      os.write(payload, static_cast<std::streamsize>(layout.indices_bytes));
+      payload += layout.indices_bytes;
+    }
+    RAFT_EXPECTS(os.good(), "ivf::serialize_lists: error writing the lists");
+    staged = 0;
+  };
+
+  for (uint32_t label = 0; label < n_lists; label++) {
+    const auto size = list_size(label);
+    if (size == 0) { continue; }  // only the size is written, together with the staged lists
+    const auto& layout = layouts(size);
+    const ListT* list  = list_at(label);
+    if (!layout.staged()) {
+      write_staged(label);
+      ivf::serialize_list<ListT>(handle, os, *list, store_spec, size);
+      first_unwritten = label + 1;
+      continue;
+    }
+    if (staged + layout.payload_bytes() > staging.size()) { write_staged(label); }
+    char* dst = staging.data_handle() + staged;
+    RAFT_CUDA_TRY(
+      cudaMemcpyAsync(dst, list->data.data_handle(), layout.data_bytes, cudaMemcpyDefault, stream));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(dst + layout.data_bytes,
+                                  list->indices.data_handle(),
+                                  layout.indices_bytes,
+                                  cudaMemcpyDefault,
+                                  stream));
+    staged += layout.payload_bytes();
+  }
+  write_staged(n_lists);
+}
+
+/**
+ * Deserialize all lists of an index from an arbitrary input stream, one list at a time.
+ *
+ * @param assign callable `(uint32_t label, std::shared_ptr<ListT> list)`; null for empty lists.
+ */
+template <typename ListT, typename ListAssign>
+void deserialize_lists(const raft::resources& handle,
+                       std::istream& is,
+                       const typename ListT::spec_type& store_spec,
+                       const typename ListT::spec_type& device_spec,
+                       raft::device_vector_view<const uint32_t, uint32_t> list_sizes,
+                       ListAssign&& assign)
+{
+  for (uint32_t label = 0; label < list_sizes.extent(0); label++) {
+    std::shared_ptr<ListT> list;
+    ivf::deserialize_list(handle, is, list, store_spec, device_spec);
+    assign(label, std::move(list));
+  }
+}
+
+/**
+ * Deserialize all lists of an index from a file. The resulting lists are the same as those of
+ * calling `deserialize_list(handle, reader, ...)` for every label.
+ *
+ * `list_sizes` (already loaded from the file) is used to plan batches of consecutive lists. Each
+ * batch is read into a pinned host buffer (at most kListStagingBytes) with one read, every record
+ * is checked to be byte-for-byte what serialize_list writes for the expected size, and the payloads
+ * are copied to the device without synchronizing per list. Lists with a payload larger than
+ * kListDirectIoBytes are read directly into device memory by deserialize_list. If a record differs
+ * from the expected bytes (e.g. an inconsistent or truncated file), the remaining lists are parsed
+ * by deserialize_list, which accepts or rejects them exactly as before.
+ *
+ * @param assign callable `(uint32_t label, std::shared_ptr<ListT> list)`; null for empty lists.
+ */
+template <typename ListT, typename ListAssign>
+void deserialize_lists(const raft::resources& handle,
+                       cuvs::util::kvikio_file_reader& reader,
+                       const typename ListT::spec_type& store_spec,
+                       const typename ListT::spec_type& device_spec,
+                       raft::device_vector_view<const uint32_t, uint32_t> list_sizes,
+                       ListAssign&& assign)
+{
+  using size_type    = typename ListT::size_type;
+  const auto n_lists = list_sizes.extent(0);
+  if (n_lists == 0) { return; }
+  cudaStream_t stream = raft::resource::get_cuda_stream(handle).get();
+
+  auto sizes = raft::make_host_vector<uint32_t, uint32_t>(n_lists);
+  raft::copy(handle, sizes.view(), list_sizes);
+  raft::resource::sync_stream(handle);
+
+  list_record_layouts<ListT> layouts(handle, store_spec);
+  auto layout_of = [&](uint32_t label) -> const list_record_layout& {
+    return layouts(static_cast<size_type>(sizes(label)));
+  };
+  size_t staged_bytes = 0;
+  for (uint32_t label = 0; label < n_lists; label++) {
+    const auto& layout = layout_of(label);
+    if (layout.staged()) { staged_bytes += layout.record_bytes(); }
+  }
+
+  auto& is      = reader.stream();
+  auto position = [&is]() -> size_t {
+    const auto pos = is.tellg();
+    RAFT_EXPECTS(pos != std::istream::pos_type(-1),
+                 "ivf::deserialize_lists: failed to determine the file position");
+    return static_cast<size_t>(static_cast<std::streamoff>(pos));
+  };
+  const auto lists_begin = is.tellg();
+  is.seekg(0, std::ios_base::end);
+  const size_t file_end = position();
+  is.seekg(lists_begin);
+  RAFT_EXPECTS(is.good(), "ivf::deserialize_lists: failed to seek in the file");
+
+  auto staging =
+    raft::make_pinned_vector<char, size_t>(handle, std::min(staged_bytes, kListStagingBytes));
+  sync_stream_on_exit sync_guard{stream};
+  bool copies_pending = false;
+
+  auto deserialize_one = [&](uint32_t label) {
+    std::shared_ptr<ListT> list;
+    ivf::deserialize_list(handle, reader, list, store_spec, device_spec);
+    assign(label, std::move(list));
+  };
+
+  uint32_t label = 0;
+  while (label < n_lists) {
+    // Plan a batch of consecutive staged lists [label, batch_end).
+    uint32_t batch_end = label;
+    size_t batch_bytes = 0;
+    for (; batch_end < n_lists; batch_end++) {
+      const auto& layout = layout_of(batch_end);
+      if (!layout.staged() || batch_bytes + layout.record_bytes() > staging.size()) { break; }
+      batch_bytes += layout.record_bytes();
+    }
+    if (batch_end == label) {
+      deserialize_one(label++);
+      continue;
+    }
+
+    const size_t batch_begin = position();
+    const size_t read_bytes  = std::min(batch_bytes, file_end - std::min(file_end, batch_begin));
+    if (copies_pending) {
+      raft::resource::sync_stream(handle);  // the previous batch is still being copied from
+      copies_pending = false;
+    }
+    // KvikIO reads into host memory with its (multi-threaded) POSIX backend.
+    if (read_bytes > 0) { reader.read_device(staging.data_handle(), read_bytes); }
+
+    size_t offset = 0;
+    for (; label < batch_end; label++) {
+      const auto size    = static_cast<size_type>(sizes(label));
+      const auto& layout = layout_of(label);
+      if (offset + layout.record_bytes() > read_bytes) { break; }
+      const char* head    = staging.data_handle() + offset;
+      const char* data    = head + layout.head.size();
+      const char* mid     = data + layout.data_bytes;
+      const char* indices = mid + layout.mid.size();
+      if (std::memcmp(head, layout.head.data(), layout.head.size()) != 0 ||
+          std::memcmp(mid, layout.mid.data(), layout.mid.size()) != 0) {
+        break;
+      }
+      std::shared_ptr<ListT> list;
+      if (size > 0) {
+        list = std::make_shared<ListT>(handle, device_spec, size);
+        RAFT_CUDA_TRY(cudaMemcpyAsync(
+          list->data.data_handle(), data, layout.data_bytes, cudaMemcpyDefault, stream));
+        // NB: copying exactly 'size' indices to leave the rest 'kInvalidRecord' intact.
+        RAFT_CUDA_TRY(cudaMemcpyAsync(
+          list->indices.data_handle(), indices, layout.indices_bytes, cudaMemcpyDefault, stream));
+        copies_pending = true;
+      }
+      assign(label, std::move(list));
+      offset += layout.record_bytes();
+    }
+    if (offset != read_bytes) { is.seekg(static_cast<std::streamoff>(batch_begin + offset)); }
+    if (label < batch_end) {
+      // The file does not match the plan; let the per-list parser handle (or reject) the rest.
+      while (label < n_lists) {
+        deserialize_one(label++);
+      }
+    }
+  }
+  raft::resource::sync_stream(handle);
+}
+
+}  // namespace detail
 }  // namespace cuvs::neighbors::ivf

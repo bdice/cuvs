@@ -69,21 +69,29 @@ void serialize(raft::resources const& handle_, Output& os, const index<IdxT>& in
   raft::copy(handle_, sizes_host.view(), index.list_sizes());
   raft::resource::sync_stream(handle_);
   cuvs::util::detail::serialize_mdspan(handle_, os, sizes_host.view());
-  // NOTE: We use static_cast here because serialize_list requires the concrete list type
+  // NOTE: We use static_cast here because serialize_lists requires the concrete list type
   // to access the spec_type for determining the serialized data layout.
   if (index.codes_layout() == list_layout::FLAT) {
     auto list_store_spec = list_spec_flat<uint32_t, IdxT>{index.pq_bits(), index.pq_dim(), true};
-    for (uint32_t label = 0; label < index.n_lists(); label++) {
-      auto& typed_list = static_cast<const list_data_flat<IdxT>&>(*index.lists()[label]);
-      ivf::serialize_list(handle_, os, typed_list, list_store_spec, sizes_host(label));
-    }
+    ivf::detail::serialize_lists<list_data_flat<IdxT>>(
+      handle_,
+      os,
+      list_store_spec,
+      raft::make_const_mdspan(sizes_host.view()),
+      [&index](uint32_t label) {
+        return static_cast<const list_data_flat<IdxT>*>(index.lists()[label].get());
+      });
   } else {
     auto list_store_spec =
       list_spec_interleaved<uint32_t, IdxT>{index.pq_bits(), index.pq_dim(), true};
-    for (uint32_t label = 0; label < index.n_lists(); label++) {
-      auto& typed_list = static_cast<const list_data_interleaved<IdxT>&>(*index.lists()[label]);
-      ivf::serialize_list(handle_, os, typed_list, list_store_spec, sizes_host(label));
-    }
+    ivf::detail::serialize_lists<list_data_interleaved<IdxT>>(
+      handle_,
+      os,
+      list_store_spec,
+      raft::make_const_mdspan(sizes_host.view()),
+      [&index](uint32_t label) {
+        return static_cast<const list_data_interleaved<IdxT>*>(index.lists()[label].get());
+      });
   }
 }
 
@@ -188,19 +196,27 @@ auto deserialize_impl(raft::resources const& handle_, Input& input) -> index<Idx
   if (codes_layout == list_layout::FLAT) {
     auto list_device_spec = list_spec_flat<uint32_t, IdxT>{pq_bits, pq_dim, cma};
     auto list_store_spec  = list_spec_flat<uint32_t, IdxT>{pq_bits, pq_dim, true};
-    for (auto& list_data_base_ptr : impl->lists()) {
-      std::shared_ptr<list_data_flat<IdxT>> typed_list;
-      ivf::deserialize_list(handle_, input, typed_list, list_store_spec, list_device_spec);
-      list_data_base_ptr = typed_list;
-    }
+    ivf::detail::deserialize_lists<list_data_flat<IdxT>>(
+      handle_,
+      input,
+      list_store_spec,
+      list_device_spec,
+      raft::make_const_mdspan(impl->list_sizes()),
+      [&impl](uint32_t label, std::shared_ptr<list_data_flat<IdxT>> list) {
+        impl->lists()[label] = std::move(list);
+      });
   } else {
     auto list_device_spec = list_spec_interleaved<uint32_t, IdxT>{pq_bits, pq_dim, cma};
     auto list_store_spec  = list_spec_interleaved<uint32_t, IdxT>{pq_bits, pq_dim, true};
-    for (auto& list_data_base_ptr : impl->lists()) {
-      std::shared_ptr<list_data_interleaved<IdxT>> typed_list;
-      ivf::deserialize_list(handle_, input, typed_list, list_store_spec, list_device_spec);
-      list_data_base_ptr = typed_list;
-    }
+    ivf::detail::deserialize_lists<list_data_interleaved<IdxT>>(
+      handle_,
+      input,
+      list_store_spec,
+      list_device_spec,
+      raft::make_const_mdspan(impl->list_sizes()),
+      [&impl](uint32_t label, std::shared_ptr<list_data_interleaved<IdxT>> list) {
+        impl->lists()[label] = std::move(list);
+      });
   }
 
   index<IdxT> idx(std::move(impl));
