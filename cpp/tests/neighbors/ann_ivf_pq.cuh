@@ -16,7 +16,6 @@
 #include <raft/linalg/add.cuh>
 #include <raft/matrix/gather.cuh>
 #include <rmm/cuda_stream_pool.hpp>
-#include <rmm/mr/managed_memory_resource.hpp>
 #include <thrust/sequence.h>
 
 #include <memory>
@@ -25,6 +24,7 @@
 #include <typeindex>
 #include <typeinfo>
 #include <utility>
+#include <vector>
 
 namespace cuvs::neighbors::ivf_pq {
 
@@ -109,9 +109,7 @@ void compare_vectors_l2(
 {
   auto n_rows = a.extent(0);
   auto dim    = a.extent(1);
-  rmm::mr::managed_memory_resource managed_memory;
-  auto dist =
-    raft::make_device_mdarray<double>(res, managed_memory, raft::make_extents<uint32_t>(n_rows));
+  auto dist   = raft::make_device_vector<double, uint32_t>(res, n_rows);
   raft::linalg::map_offset(res, dist.view(), [a, b, dim] __device__(uint32_t i) {
     cuvs::spatial::knn::detail::utils::mapping<float> f{};
     double d = 0.0f;
@@ -121,9 +119,13 @@ void compare_vectors_l2(
     }
     return sqrt(d / double(dim));
   });
+  // Copy all distances at once: reading the elements of a device array on the host one by one
+  // copies and synchronizes for each of them.
+  std::vector<double> dist_host(n_rows);
+  raft::copy(dist_host.data(), dist.data_handle(), n_rows, raft::resource::get_cuda_stream(res));
   raft::resource::sync_stream(res);
   for (uint32_t i = 0; i < n_rows; i++) {
-    double d = dist(i);
+    double d = dist_host[i];
     // The theoretical estimate of the error is hard to come up with,
     // the estimate below is based on experimentation + curse of dimensionality
     ASSERT_LE(d, 1.2 * eps * std::pow(2.0, compression_ratio))
