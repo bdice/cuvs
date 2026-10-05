@@ -7,6 +7,7 @@
 
 #include "../../core/nvtx.hpp"
 #include "../../core/omp_wrapper.hpp"
+#include "hnsw_half_distance.hpp"
 #include "hnsw_layered_format.hpp"
 
 #include <cuvs/neighbors/brute_force.hpp>
@@ -188,6 +189,29 @@ struct hnsw_dist_t<int8_t> {
   using type = int;
 };
 
+/**
+ * hnswlib space for half vectors: squared L2 distance, or 1 - inner product.
+ *
+ * Same data layout as `hnswlib::L2Space<half, float>` / `hnswlib::InnerProductSpace<half, float>`,
+ * but each element is widened to float (see hnsw_half_distance.hpp) instead of rounding every
+ * difference or product to fp16 with the host `cuda_fp16` operators.
+ */
+template <bool InnerProduct>
+class half_space : public hnswlib::SpaceInterface<float> {
+ public:
+  explicit half_space(size_t dim) : dim_{dim}, dist_func_{select_half_distance<InnerProduct>()} {}
+
+  auto get_data_size() -> size_t override { return dim_ * sizeof(half); }
+
+  auto get_dist_func() -> hnswlib::DISTFUNC<float> override { return dist_func_; }
+
+  auto get_dist_func_param() -> void* override { return &dim_; }
+
+ private:
+  size_t dim_;
+  hnswlib::DISTFUNC<float> dist_func_;
+};
+
 // Map the dataset element type to a cudaDataType_t. This is a host-only helper that
 // intentionally avoids pulling CUDA/device dependencies.
 template <typename T>
@@ -231,10 +255,17 @@ struct index_impl : index<T> {
              HnswOutputFormat output_format = HnswOutputFormat::HNSWLIB)
     : index<T>{dim, metric, hierarchy, output_format}
   {
-    if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    if constexpr (std::is_same_v<T, half>) {
+      static_assert(sizeof(half) == sizeof(uint16_t), "half must be IEEE binary16");
+      if (metric == cuvs::distance::DistanceType::InnerProduct) {
+        space_ = std::make_unique<half_space<true>>(dim);
+      } else if (metric == cuvs::distance::DistanceType::L2Expanded) {
+        space_ = std::make_unique<half_space<false>>(dim);
+      }
+    } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
       space_ = std::make_unique<hnswlib::InnerProductSpace<T, typename hnsw_dist_t<T>::type>>(dim);
     } else if (metric == cuvs::distance::DistanceType::L2Expanded) {
-      if constexpr (std::is_same_v<T, float> || std::is_same_v<T, half>) {
+      if constexpr (std::is_same_v<T, float>) {
         space_ = std::make_unique<hnswlib::L2Space<T, typename hnsw_dist_t<T>::type>>(dim);
       } else if constexpr (std::is_same_v<T, std::int8_t> or std::is_same_v<T, std::uint8_t>) {
         space_ = std::make_unique<hnswlib::L2SpaceI<T>>(dim);
