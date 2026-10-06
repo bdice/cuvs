@@ -1135,9 +1135,9 @@ class batch_runner {
           }
         }
         if (dispatch_error != nullptr) {
-          release_failed_batch(stream, batch_id, next_seq_id, next_token_ref);
           batch_queue_.failed_sequence_id(seq_id).store(seq_id.value,
                                                         cuda::std::memory_order_relaxed);
+          release_failed_batch(stream, batch_id, next_seq_id, next_token_ref);
         }
         dispatch_sequence_id_ref.store(seq_id.value, cuda::std::memory_order_release);
         dispatch_sequence_id_ref.notify_all();
