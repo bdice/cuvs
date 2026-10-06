@@ -1129,6 +1129,7 @@ class batch_runner {
                                            kernel_progress_counters_.data_handle() + batch_id,
                                            &next_token_ref,
                                            batch_queue::make_seq_batch_id(next_seq_id, batch_id));
+            RAFT_CUDA_TRY(cudaPeekAtLastError());
             RAFT_CUDA_TRY(cudaEventRecord(completion_events_[batch_id].value(), stream.get()));
           } catch (...) {
             dispatch_error = std::current_exception();
