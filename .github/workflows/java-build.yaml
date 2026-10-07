@@ -15,12 +15,13 @@ on:
         description: "Full git commit SHA to check out"
         type: string
       matrix_filter:
-        description: |
-          jq expression which modifies the conda-cpp-build matrix.
-          Each entry has default 'GPU' and 'DRIVER' fields that select the runner.
-          For example, 'map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")' to test amd64 on RTX PRO 6000 GPUs.
+        description: "jq expression which modifies the conda-cpp-build matrix."
         type: string
         default: "."
+      node_type:
+        description: "Runner label suffix. Runner labels are of the form 'linux-{arch}-{node_type}'."
+        type: string
+        default: "cpu8"
       container_image:
         description: "Container image URI. '{0}', '{1}', '{2}', and '{3}' are replaced by the matrix entry's CUDA_VER, PY_VER, ARCH, and LINUX_VER."
         required: true
@@ -32,11 +33,11 @@ on:
       file_to_upload:
         description: "Path to file(s) to be uploaded as a CI artifact."
         type: string
-        default: "gh-status.json"
+        required: true
       artifact-name:
         description: "Identifier for the GitHub Actions artifact created by uploading 'file_to_upload', with the same placeholders as 'container_image'."
         type: string
-        default: "result"
+        required: true
 
 defaults:
   run:
@@ -63,20 +64,19 @@ jobs:
     with:
       build_type: ${{ inputs.build_type }}
       matrix_name: conda-cpp-build
-      matrix_filter: 'map(. + {GPU: "l4", DRIVER: "latest"}) | ${{ inputs.matrix_filter }}'
-  tests:
-    name: ${{ matrix.CUDA_VER }}, ${{ matrix.PY_VER }}, ${{ matrix.ARCH }}, ${{ matrix.LINUX_VER }}, ${{ matrix.GPU }}, ${{ matrix.DRIVER }}-driver
+      matrix_filter: ${{ inputs.matrix_filter }}
+  build:
+    name: ${{ matrix.CUDA_VER }}, ${{ matrix.PY_VER }}, ${{ matrix.ARCH }}, ${{ matrix.LINUX_VER }}
     needs: compute-matrix
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
-    runs-on: "linux-${{ matrix.ARCH }}-gpu-${{ matrix.GPU }}-${{ matrix.DRIVER }}-1"
+    runs-on: "linux-${{ matrix.ARCH }}-${{ inputs.node_type }}"
     env:
       RAPIDS_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
     container:
       image: ${{ format(inputs.container_image, matrix.CUDA_VER, matrix.PY_VER, matrix.ARCH, matrix.LINUX_VER) }} # zizmor: ignore[unpinned-images]
       env:
-        NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
         RAPIDS_BUILD_TYPE: ${{ inputs.build_type }}
     steps:
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -153,7 +153,7 @@ jobs:
         with:
           name: ${{ format(inputs.artifact-name, matrix.CUDA_VER, matrix.PY_VER, matrix.ARCH, matrix.LINUX_VER) }}
           path: ${{ inputs.file_to_upload }}
-          if-no-files-found: ignore
+          if-no-files-found: error
       - name: Upload additional artifacts
         if: "!cancelled()"
         run: rapids-upload-artifacts-dir "custom-job-$(arch)"

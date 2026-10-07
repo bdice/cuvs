@@ -5,6 +5,12 @@ on:
         description: "One of: [branch, nightly, pull-request]"
         required: true
         type: string
+      branch:
+        description: "Git branch the workflow run targets. Used to organize artifacts."
+        type: string
+      date:
+        description: "Date (YYYY-MM-DD) this run is for. Used to organize artifacts produced by nightly builds"
+        type: string
       sha:
         description: "Full git commit SHA to check out"
         type: string
@@ -37,6 +43,12 @@ jobs:
           ref: ${{ inputs.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Standardize repository information
+        uses: rapidsai/shared-actions/rapids-github-info@main
+        with:
+          branch: ${{ inputs.branch }}
+          date: ${{ inputs.date }}
+          sha: ${{ inputs.sha }}
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
