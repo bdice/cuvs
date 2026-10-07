@@ -608,8 +608,6 @@ jobs:
       artifact-name-prefix: "cuvs-java"
       file_to_upload: "java/cuvs-java/target/"
   conda-java-tests:
-    # Tests the amd64-built cuvs-java jar on every architecture without recompiling, which
-    # verifies that its jextract-generated Panama bindings are portable -- see ci/test_java.sh.
     needs: conda-java-build
     permissions:
       actions: read
@@ -641,8 +639,6 @@ jobs:
       artifact-name-prefix: "cuvs-lucene"
       file_to_upload: "java/cuvs-lucene/target/"
   conda-lucene-tests:
-    # Tests the amd64-built cuvs-lucene classes on every architecture without recompiling
-    # -- see ci/test_lucene.sh.
     needs: conda-lucene-build
     permissions:
       actions: read

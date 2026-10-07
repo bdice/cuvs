@@ -107,8 +107,6 @@ jobs:
       script: ci/test_python.sh
       sha: ${{ inputs.sha }}
   conda-java-tests:
-    # Tests the amd64-built cuvs-java jar from build.yaml on every architecture without recompiling,
-    # which verifies that its jextract-generated Panama bindings are portable -- see ci/test_java.sh.
     permissions:
       actions: read
       contents: read
@@ -123,8 +121,6 @@ jobs:
       sha: ${{ inputs.sha }}
       script: "ci/test_java.sh"
   conda-lucene-tests:
-    # Tests the amd64-built cuvs-lucene classes from build.yaml on every architecture without
-    # recompiling -- see ci/test_lucene.sh.
     permissions:
       actions: read
       contents: read
