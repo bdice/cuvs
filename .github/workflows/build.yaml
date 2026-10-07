@@ -69,72 +69,42 @@ jobs:
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
-  rust-build-matrix:
-    needs: cpp-build
-    permissions:
-      contents: read
-    uses: rapidsai/shared-workflows/.github/workflows/compute-matrix.yaml@main
-    with:
-      build_type: pull-request
-      matrix_name: conda-cpp-build
-      matrix_filter: map(select(.ARCH == "amd64"))
   rust-build:
-    needs: rust-build-matrix
-    permissions:
-      actions: read
-      contents: read
-      id-token: write
-      packages: read
-      pull-requests: read
-    secrets: inherit # zizmor: ignore[secrets-inherit]
-    uses: rapidsai/shared-workflows/.github/workflows/custom-job.yaml@main
-    # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
-    # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.rust-build-matrix.outputs.matrix) }}
-    with:
-      build_type: ${{ inputs.build_type || 'branch' }}
-      branch: ${{ inputs.branch }}
-      arch: "amd64"
-      date: ${{ inputs.date }}
-      container_image: "rapidsai/ci-conda:26.12-cuda${{ matrix.CUDA_VER }}-${{ matrix.LINUX_VER }}-py${{ matrix.PY_VER }}"
-      node_type: "gpu-rtxpro6000-latest-1"
-      script: "ci/build_rust.sh"
-      sha: ${{ inputs.sha }}
-  go-build-matrix:
     needs: cpp-build
     permissions:
+      actions: read
       contents: read
-    uses: rapidsai/shared-workflows/.github/workflows/compute-matrix.yaml@main
+      id-token: write
+      packages: read
+      pull-requests: read
+    uses: ./.github/workflows/gpu-matrix-job.yaml
+    # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
+    # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
     with:
       build_type: ${{ inputs.build_type || 'branch' }}
-      matrix_name: conda-cpp-build
-      matrix_filter: map(select(.ARCH == "amd64"))
+      branch: ${{ inputs.branch }}
+      date: ${{ inputs.date }}
+      sha: ${{ inputs.sha }}
+      matrix_filter: map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")
+      script: "ci/build_rust.sh"
   go-build:
-    needs: go-build-matrix
+    needs: cpp-build
     permissions:
       actions: read
       contents: read
       id-token: write
       packages: read
       pull-requests: read
-    secrets: inherit # zizmor: ignore[secrets-inherit]
-    uses: rapidsai/shared-workflows/.github/workflows/custom-job.yaml@main
+    uses: ./.github/workflows/gpu-matrix-job.yaml
     # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
     # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.go-build-matrix.outputs.matrix) }}
     with:
       build_type: ${{ inputs.build_type || 'branch' }}
       branch: ${{ inputs.branch }}
-      arch: "amd64"
       date: ${{ inputs.date }}
-      container_image: "rapidsai/ci-conda:26.12-cuda${{ matrix.CUDA_VER }}-${{ matrix.LINUX_VER }}-py${{ matrix.PY_VER }}"
-      node_type: "gpu-rtxpro6000-latest-1"
-      script: "ci/build_go.sh"
       sha: ${{ inputs.sha }}
+      matrix_filter: map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")
+      script: "ci/build_go.sh"
   java-build:
     needs: cpp-build
     permissions:
