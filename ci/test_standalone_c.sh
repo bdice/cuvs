@@ -49,7 +49,13 @@ if command -v dnf >/dev/null; then
   dnf install \
     -y \
     --setopt=install_weak_deps=False \
-    "cuda-toolkit-${CTK_PACKAGE_SUFFIX}" \
+    "cuda-nvrtc-${CTK_PACKAGE_SUFFIX}" \
+    "libcublas-${CTK_PACKAGE_SUFFIX}" \
+    "libcufile-${CTK_PACKAGE_SUFFIX}" \
+    "libcurand-${CTK_PACKAGE_SUFFIX}" \
+    "libcusolver-${CTK_PACKAGE_SUFFIX}" \
+    "libcusparse-${CTK_PACKAGE_SUFFIX}" \
+    "libnvjitlink-${CTK_PACKAGE_SUFFIX}" \
     "libnccl-*+cuda${CUDA_MAJOR_MINOR}*"
 else
   apt-get update
@@ -57,7 +63,13 @@ else
     apt-get install \
       -y \
       --no-install-recommends \
-      "cuda-toolkit-${CTK_PACKAGE_SUFFIX}" \
+      "cuda-nvrtc-${CTK_PACKAGE_SUFFIX}" \
+      "libcublas-${CTK_PACKAGE_SUFFIX}" \
+      "libcufile-${CTK_PACKAGE_SUFFIX}" \
+      "libcurand-${CTK_PACKAGE_SUFFIX}" \
+      "libcusolver-${CTK_PACKAGE_SUFFIX}" \
+      "libcusparse-${CTK_PACKAGE_SUFFIX}" \
+      "libnvjitlink-${CTK_PACKAGE_SUFFIX}" \
       "libnccl2=*+cuda${CUDA_MAJOR_MINOR}"
 fi
 
