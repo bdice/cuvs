@@ -612,7 +612,7 @@ jobs:
       file_to_upload: "java/cuvs-java/target/"
   conda-java-tests:
     # Tests the amd64-built cuvs-java jar on every architecture without recompiling, which
-    # verifies that its jextract-generated Panama bindings are portable -- see ci/test_java_prebuilt.sh.
+    # verifies that its jextract-generated Panama bindings are portable -- see ci/test_java.sh.
     needs: conda-java-build
     permissions:
       actions: read
@@ -625,7 +625,7 @@ jobs:
       build_type: pull-request
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
-      script: "ci/test_java_prebuilt.sh {2} cuvs-java-cuda{0}"
+      script: "ci/test_java.sh cuvs-java-cuda{0}"
   conda-lucene-build:
     # Depends on the Java job for the cuvs-java artifact that cuvs-lucene builds against.
     needs: conda-java-build
@@ -647,7 +647,7 @@ jobs:
       file_to_upload: "java/cuvs-lucene/target/"
   conda-lucene-tests:
     # Tests the amd64-built cuvs-lucene classes on every architecture without recompiling
-    # -- see ci/test_lucene_prebuilt.sh.
+    # -- see ci/test_lucene.sh.
     needs: conda-lucene-build
     permissions:
       actions: read
@@ -660,7 +660,7 @@ jobs:
       build_type: pull-request
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
-      script: "ci/test_lucene_prebuilt.sh {2} cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
+      script: "ci/test_lucene.sh cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
   rust-build-matrix:
     needs: [conda-cpp-build, changed-files]
     permissions:

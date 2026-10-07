@@ -108,7 +108,7 @@ jobs:
       sha: ${{ inputs.sha }}
   conda-java-tests:
     # Tests the amd64-built cuvs-java jar from build.yaml on every architecture without recompiling,
-    # which verifies that its jextract-generated Panama bindings are portable -- see ci/test_java_prebuilt.sh.
+    # which verifies that its jextract-generated Panama bindings are portable -- see ci/test_java.sh.
     permissions:
       actions: read
       contents: read
@@ -123,10 +123,10 @@ jobs:
       sha: ${{ inputs.sha }}
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
-      script: "ci/test_java_prebuilt.sh {2} cuvs-java-cuda{0}"
+      script: "ci/test_java.sh cuvs-java-cuda{0}"
   conda-lucene-tests:
     # Tests the amd64-built cuvs-lucene classes from build.yaml on every architecture without
-    # recompiling -- see ci/test_lucene_prebuilt.sh.
+    # recompiling -- see ci/test_lucene.sh.
     permissions:
       actions: read
       contents: read
@@ -141,7 +141,7 @@ jobs:
       sha: ${{ inputs.sha }}
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
-      script: "ci/test_lucene_prebuilt.sh {2} cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
+      script: "ci/test_lucene.sh cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
   wheel-tests-cuvs:
     permissions:
       actions: read
