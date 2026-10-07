@@ -26,7 +26,7 @@ on:
         type: string
         default: "rapidsai/ci-conda"
       script:
-        description: "Shell code to be executed in a step. '{0}', '{1}', '{2}', and '{3}' are replaced by the matrix entry's CUDA_VER, PY_VER, ARCH, and LINUX_VER."
+        description: "Shell code to be executed in a step."
         required: true
         type: string
       file_to_upload:
@@ -34,7 +34,7 @@ on:
         type: string
         default: "gh-status.json"
       artifact-name:
-        description: "Identifier for the GitHub Actions artifact created by uploading 'file_to_upload', with the same placeholders as 'script'."
+        description: "Identifier for the GitHub Actions artifact created by uploading 'file_to_upload'."
         type: string
         default: "result"
 
@@ -141,7 +141,7 @@ jobs:
           $INPUTS_SCRIPT
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUTS_SCRIPT: ${{ format(inputs.script, matrix.CUDA_VER, matrix.PY_VER, matrix.ARCH, matrix.LINUX_VER) }}
+          INPUTS_SCRIPT: ${{ inputs.script }}
           # opt out of conda sharded repodata
           #
           # TODO: remove these when this is resolved: https://github.com/conda/infrastructure/issues/1286#issuecomment-4628580232
@@ -151,7 +151,7 @@ jobs:
       - name: Upload file to GitHub Artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ format(inputs.artifact-name, matrix.CUDA_VER, matrix.PY_VER, matrix.ARCH, matrix.LINUX_VER) }}
+          name: ${{ inputs.artifact-name }}
           path: ${{ inputs.file_to_upload }}
           if-no-files-found: ignore
       - name: Upload additional artifacts

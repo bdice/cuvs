@@ -10,11 +10,9 @@ set -euo pipefail
 # architecture. Since cuvs-lucene depends on the plain (no bundled natives) cuvs-java jar,
 # this doubles as a cross-arch check that the jextract-generated Panama bindings baked
 # into the amd64 jar work unmodified against a native libcuvs_c.so on that architecture.
-#
-# Takes the names of the cuvs-java and cuvs-lucene artifacts uploaded by the amd64 jobs.
 
-CUVS_JAVA_ARTIFACT="${1:?Usage: $0 <cuvs-java-artifact-name> <cuvs-lucene-artifact-name>}"
-CUVS_LUCENE_ARTIFACT="${2:?Usage: $0 <cuvs-java-artifact-name> <cuvs-lucene-artifact-name>}"
+CUVS_JAVA_ARTIFACT="cuvs-java-cuda${RAPIDS_CUDA_VERSION}"
+CUVS_LUCENE_ARTIFACT="cuvs-lucene-cuda${RAPIDS_CUDA_VERSION}"
 
 rapids-logger "Testing the amd64-built cuvs-java/cuvs-lucene artifacts on $(arch)"
 

@@ -8,10 +8,8 @@ set -euo pipefail
 # without recompiling (or running jextract) on this host. cuvs-java is always built on
 # amd64; this verifies that the resulting jextract-generated Panama bindings also work
 # correctly against a native libcuvs_c.so on this host's architecture.
-#
-# Takes the name of the cuvs-java artifact uploaded by the amd64 Java job.
 
-CUVS_JAVA_ARTIFACT="${1:?Usage: $0 <cuvs-java-artifact-name>}"
+CUVS_JAVA_ARTIFACT="cuvs-java-cuda${RAPIDS_CUDA_VERSION}"
 
 rapids-logger "Testing the amd64-built cuvs-java artifact on $(arch)"
 

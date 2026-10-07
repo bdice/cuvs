@@ -4,14 +4,8 @@
 
 set -euo pipefail
 
-# Takes the name of the cuvs-java artifact uploaded by the Java job.
 EXTRA_BUILD_ARGS=("--build-java-examples")
-CUVS_JAVA_ARTIFACT="${1:-}"
-
-if [ -z "${CUVS_JAVA_ARTIFACT}" ]; then
-  echo "Error: name of the cuvs-java artifact is missing" >&2
-  exit 1
-fi
+CUVS_JAVA_ARTIFACT="cuvs-java-cuda${RAPIDS_CUDA_VERSION}"
 
 if [ -e "/opt/conda/etc/profile.d/conda.sh" ]; then
   . /opt/conda/etc/profile.d/conda.sh

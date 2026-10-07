@@ -153,7 +153,7 @@ jobs:
       sha: ${{ inputs.sha }}
       matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_java.sh"
-      artifact-name: "cuvs-java-cuda{0}"
+      artifact-name-prefix: "cuvs-java"
       file_to_upload: "java/cuvs-java/target/"
   lucene-build:
     # Depends on the Java job for the cuvs-java artifact that cuvs-lucene builds against.
@@ -173,8 +173,8 @@ jobs:
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
       matrix_filter: map(select(.ARCH == "amd64"))
-      script: "ci/build_lucene.sh cuvs-java-cuda{0}"
-      artifact-name: "cuvs-lucene-cuda{0}"
+      script: "ci/build_lucene.sh"
+      artifact-name-prefix: "cuvs-lucene"
       file_to_upload: "java/cuvs-lucene/target/"
   python-build:
     needs: [build-details, cpp-build]

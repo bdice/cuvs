@@ -122,7 +122,7 @@ jobs:
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
-      script: "ci/test_java.sh cuvs-java-cuda{0}"
+      script: "ci/test_java.sh"
   conda-lucene-tests:
     # Tests the amd64-built cuvs-lucene classes from build.yaml on every architecture without
     # recompiling -- see ci/test_lucene.sh.
@@ -139,7 +139,7 @@ jobs:
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
-      script: "ci/test_lucene.sh cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
+      script: "ci/test_lucene.sh"
   wheel-tests-cuvs:
     permissions:
       actions: read

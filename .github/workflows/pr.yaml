@@ -590,7 +590,7 @@ jobs:
       build_type: pull-request
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       container-image-repository: "rapidsai/citestwheel"
-      script: "ci/test_standalone_c.sh libcuvs_c_{0}_{2}.tar.gz"
+      script: "ci/test_standalone_c.sh"
   conda-java-build:
     needs: [conda-cpp-build, changed-files]
     permissions:
@@ -607,7 +607,7 @@ jobs:
       build_type: pull-request
       matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_java.sh"
-      artifact-name: "cuvs-java-cuda{0}"
+      artifact-name-prefix: "cuvs-java"
       file_to_upload: "java/cuvs-java/target/"
   conda-java-tests:
     # Tests the amd64-built cuvs-java jar on every architecture without recompiling, which
@@ -623,7 +623,7 @@ jobs:
     with:
       build_type: pull-request
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
-      script: "ci/test_java.sh cuvs-java-cuda{0}"
+      script: "ci/test_java.sh"
   conda-lucene-build:
     # Depends on the Java job for the cuvs-java artifact that cuvs-lucene builds against.
     needs: conda-java-build
@@ -639,8 +639,8 @@ jobs:
     with:
       build_type: pull-request
       matrix_filter: map(select(.ARCH == "amd64"))
-      script: "ci/build_lucene.sh cuvs-java-cuda{0}"
-      artifact-name: "cuvs-lucene-cuda{0}"
+      script: "ci/build_lucene.sh"
+      artifact-name-prefix: "cuvs-lucene"
       file_to_upload: "java/cuvs-lucene/target/"
   conda-lucene-tests:
     # Tests the amd64-built cuvs-lucene classes on every architecture without recompiling
@@ -656,7 +656,7 @@ jobs:
     with:
       build_type: pull-request
       matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
-      script: "ci/test_lucene.sh cuvs-java-cuda{0} cuvs-lucene-cuda{0}"
+      script: "ci/test_lucene.sh"
   rust-build-matrix:
     needs: [conda-cpp-build, changed-files]
     permissions:
