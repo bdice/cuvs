@@ -21,12 +21,12 @@ on:
           For example, 'map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")' to test amd64 on RTX PRO 6000 GPUs.
         type: string
         default: "."
-      container_image:
-        description: "Container image URI. '{0}', '{1}', '{2}', and '{3}' are replaced by the matrix entry's CUDA_VER, PY_VER, ARCH, and LINUX_VER."
-        required: true
+      container-image-repository:
+        description: "CI image repository without its tag, e.g. 'rapidsai/ci-conda' or 'rapidsai/citestwheel'. The tag is derived from the matrix entry."
         type: string
+        default: "rapidsai/ci-conda"
       script:
-        description: "Shell code to be executed in a step, with the same placeholders as 'container_image'."
+        description: "Shell code to be executed in a step. '{0}', '{1}', '{2}', and '{3}' are replaced by the matrix entry's CUDA_VER, PY_VER, ARCH, and LINUX_VER."
         required: true
         type: string
       file_to_upload:
@@ -34,7 +34,7 @@ on:
         type: string
         default: "gh-status.json"
       artifact-name:
-        description: "Identifier for the GitHub Actions artifact created by uploading 'file_to_upload', with the same placeholders as 'container_image'."
+        description: "Identifier for the GitHub Actions artifact created by uploading 'file_to_upload', with the same placeholders as 'script'."
         type: string
         default: "result"
 
@@ -74,7 +74,7 @@ jobs:
     env:
       RAPIDS_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
     container:
-      image: ${{ format(inputs.container_image, matrix.CUDA_VER, matrix.PY_VER, matrix.ARCH, matrix.LINUX_VER) }} # zizmor: ignore[unpinned-images]
+      image: ${{ inputs.container-image-repository }}:26.12-cuda${{ matrix.CUDA_VER }}-${{ matrix.LINUX_VER }}-py${{ matrix.PY_VER }} # zizmor: ignore[unpinned-images]
       env:
         NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
         RAPIDS_BUILD_TYPE: ${{ inputs.build_type }}

@@ -152,7 +152,6 @@ jobs:
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
       matrix_filter: map(select(.ARCH == "amd64"))
-      container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
       script: "ci/build_java.sh"
       artifact-name: "cuvs-java-cuda{0}"
       file_to_upload: "java/cuvs-java/target/"
@@ -174,7 +173,6 @@ jobs:
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
       matrix_filter: map(select(.ARCH == "amd64"))
-      container_image: "rapidsai/ci-conda:26.12-cuda{0}-{3}-py{1}"
       script: "ci/build_lucene.sh cuvs-java-cuda{0}"
       artifact-name: "cuvs-lucene-cuda{0}"
       file_to_upload: "java/cuvs-lucene/target/"
