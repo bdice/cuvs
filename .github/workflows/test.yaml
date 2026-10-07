@@ -115,13 +115,12 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/gpu-matrix-job.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     with:
       build_type: ${{ inputs.build_type }}
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
-      matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       script: "ci/test_java.sh"
   conda-lucene-tests:
     # Tests the amd64-built cuvs-lucene classes from build.yaml on every architecture without
@@ -132,13 +131,12 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/gpu-matrix-job.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     with:
       build_type: ${{ inputs.build_type }}
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
-      matrix_filter: 'map(.GPU = (if .ARCH == "amd64" then "rtxpro6000" else "l4" end))'
       script: "ci/test_lucene.sh"
   wheel-tests-cuvs:
     permissions:

@@ -77,7 +77,7 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/gpu-matrix-job.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
     # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
     with:
@@ -85,7 +85,7 @@ jobs:
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
-      matrix_filter: map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")
+      matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_rust.sh"
   go-build:
     needs: cpp-build
@@ -95,7 +95,7 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/gpu-matrix-job.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
     # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
     with:
@@ -103,7 +103,7 @@ jobs:
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
-      matrix_filter: map(select(.ARCH == "amd64")) | map(.GPU = "rtxpro6000")
+      matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_go.sh"
   java-build:
     needs: cpp-build
@@ -113,7 +113,7 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/java-build.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
     # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
     with:
@@ -121,6 +121,7 @@ jobs:
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
+      node_type: cpu8
       matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_java.sh"
       artifact-name-prefix: "cuvs-java"
@@ -134,7 +135,7 @@ jobs:
       id-token: write
       packages: read
       pull-requests: read
-    uses: ./.github/workflows/java-build.yaml
+    uses: ./.github/workflows/matrix-job.yaml
     # Artifacts are not published from these jobs, so it's safe to run for multiple CUDA versions.
     # If these jobs start producing artifacts, the names will have to differentiate between CUDA versions.
     with:
@@ -142,6 +143,7 @@ jobs:
       branch: ${{ inputs.branch }}
       date: ${{ inputs.date }}
       sha: ${{ inputs.sha }}
+      node_type: cpu8
       matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_lucene.sh"
       artifact-name-prefix: "cuvs-lucene"
