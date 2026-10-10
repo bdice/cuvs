@@ -20,6 +20,8 @@
 #include <raft/stats/adjusted_rand_index.cuh>
 #include <raft/util/cudart_utils.hpp>
 
+#include "diag_lanczos.cuh"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -95,7 +97,7 @@ void run_spectral_diag()
   cudaStream_t stream = raft::resource::get_cuda_stream(handle).get();
 
   counter c_x, c_graph, c_lap, c_eig, c_emb, c_kmeans_fixed, c_labels, c_fp;
-  int n_bad = 0, n_bad_fp = 0;
+  int n_bad = 0, n_bad_fp = 0, n_missed = 0;
   std::vector<float> first_embedding;
   std::vector<int> first_r, first_c;
   std::vector<float> first_v;
@@ -174,9 +176,23 @@ void run_spectral_diag()
     auto evals            = raft::make_device_vector<float, uint32_t>(handle, n_comp);
     auto evecs =
       raft::make_device_matrix<float, uint32_t, raft::col_major>(handle, n_samples, n_comp);
-    raft::sparse::solver::lanczos_compute_eigenpairs<int, float>(
-      handle, config, laplacian.view(), std::nullopt, evals.view(), evecs.view());
-    auto h_evals = to_host(evals.data_handle(), n_comp, stream);
+    raft::sparse::solver::diag_detail::lanczos_trace().clear();
+    raft::sparse::solver::diag_detail::lanczos_compute_eigenpairs<int, float>(
+      handle,
+      config,
+      laplacian.view(),
+      std::optional<raft::device_vector_view<float, uint32_t>>{},
+      evals.view(),
+      evecs.view());
+    auto h_evals     = to_host(evals.data_handle(), n_comp, stream);
+    bool missed_null = std::abs(h_evals[0]) > 1e-4f;
+    if (r == 0 || missed_null) {
+      printf("[diag] r=%d lanczos trace%s:\n%s",
+             r,
+             missed_null ? " (MISSED NULL VECTOR)" : "",
+             raft::sparse::solver::diag_detail::lanczos_trace().c_str());
+    }
+    if (missed_null) n_missed++;
     int ie =
       c_eig.add(fnv(h_evals) ^ (fnv(to_host(evecs.data_handle(), evecs.size(), stream)) * 11));
 
@@ -330,7 +346,7 @@ void run_spectral_diag()
   }
   printf(
     "[diag-summary] repeats=%d distinct: X=%zu graph=%zu lap=%zu eig=%zu emb=%zu kmeans_fixed=%zu "
-    "labels=%zu fp=%zu; ari<0.7: %d, ari_fp<0.7: %d\n",
+    "labels=%zu fp=%zu; ari<0.7: %d, ari_fp<0.7: %d, lanczos missed null vector: %d\n",
     repeats,
     c_x.m.size(),
     c_graph.m.size(),
@@ -341,7 +357,8 @@ void run_spectral_diag()
     c_labels.m.size(),
     c_fp.m.size(),
     n_bad,
-    n_bad_fp);
+    n_bad_fp,
+    n_missed);
 }
 
 TEST(SpectralClusteringDiag, Result7) { run_spectral_diag(); }
