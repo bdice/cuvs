@@ -61,7 +61,7 @@ public class TestDiagFilteredMultiPartitionShortfall extends LuceneTestCase {
   public void measureShortfallRate() throws Exception {
     int trials = Integer.getInteger("diag.trials", 6);
     int numQueries = Integer.getInteger("diag.queries", 64);
-    int[] numCategoriesOptions = {24, 48};
+    int[] numCategoriesOptions = {24};
     final int datasetSize = 2000;
     final int dimensions = 128;
     final int topK = 10;

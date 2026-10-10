@@ -98,11 +98,11 @@ pushd java/cuvs-lucene
 MVN_TEST=(mvn --batch-mode test -Dskip.compile=true -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false)
 
 rapids-logger "DIAG: shortfall rate of filtered multi-partition search"
-"${MVN_TEST[@]}" -Dtest=TestDiagFilteredMultiPartitionShortfall -Ddiag.trials=6 2>&1 | grep -E "DIAG|FAIL|ERROR|Tests run" || true
+"${MVN_TEST[@]}" -Dtest=TestDiagFilteredMultiPartitionShortfall -Ddiag.trials=12 2>&1 | grep -E "DIAG|FAIL|ERROR|Tests run" || true
 
 rapids-logger "DIAG: failing CI seeds"
-for seed in 4A2D37AD61DD7303 C28C44A945519487 653B80E5E4427103 DDB057FC1538C8F3 ED8335DC8AEF8040 EE3B5EEAC86DF8C; do
-  for rep in 1 2 3; do
+for seed in 4A2D37AD61DD7303 C28C44A945519487 DDB057FC1538C8F3 EE3B5EEAC86DF8C; do
+  for rep in 1 2 3 4 5 6 7 8; do
     echo "SEEDRUN TestMultiSegmentGPUFilterConcurrency seed=${seed} rep=${rep}"
     "${MVN_TEST[@]}" -Dtest='TestMultiSegmentGPUFilterConcurrency#filteredSearchesTakeTheMultiPartitionGpuPath' -Dtests.seed="${seed}" 2>&1 | grep -E "AssertionError|Tests run:|FAIL" | head -5 || true
   done

@@ -301,4 +301,18 @@ TEST(AnnCagraMultiPartition, MixedGraphDegreeRejected)
                                        cagra::search_params{});
 }
 
+// [DO NOT MERGE] Diagnostic: an explicit rate of 0 reproduces the behavior before the fix.
+TEST(AnnCagraMultiPartitionDiag, SelectiveFilterRateComparison)
+{
+  for (float rate : {0.0f, -1.0f}) {
+    for (int rep = 0; rep < 5; rep++) {
+      int short_queries = 0;
+      double recall     = 0;
+      search_with_selective_filter(rate, short_queries, recall);
+      std::cout << "DIAG-CPP filtering_rate=" << rate << " rep=" << rep
+                << " short_queries=" << short_queries << "/500 recall=" << recall << std::endl;
+    }
+  }
+}
+
 }  // namespace cuvs::neighbors::cagra
