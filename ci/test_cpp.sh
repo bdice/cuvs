@@ -93,9 +93,15 @@ for i in $(seq 1 "${FRESH_RUNS}"); do
   fi
 done
 echo "SUMMARY fresh-process Result/7: ${fresh_fail}/${FRESH_RUNS} runs failed"
+
+rapids-logger "Distance and 1-NN tests"
+other_fail=0
+./DISTANCE_TEST --gtest_brief=1 || other_fail=$((other_fail + 1))
+./NEIGHBORS_TEST --gtest_filter='NNTest*:Top1nn*' --gtest_brief=1 || other_fail=$((other_fail + 1))
+echo "SUMMARY distance / 1-NN test binaries failed: ${other_fail}"
 popd
 
-if [[ ${full_fail} -gt 0 || ${fresh_fail} -gt 0 ]] || grep -q '^\[  FAILED  \]' "${LOGDIR}/repeat.log"; then
+if [[ ${full_fail} -gt 0 || ${fresh_fail} -gt 0 || ${other_fail} -gt 0 ]] || grep -q '^\[  FAILED  \]' "${LOGDIR}/repeat.log"; then
   EXITCODE=1
 fi
 

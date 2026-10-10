@@ -91,7 +91,8 @@ void run_spectral_diag()
   const int n_samples = 1000, n_features = 30, n_clusters = 5, n_comp = 5, n_neighbors = 20,
             n_init        = 3;
   const float cluster_std = 0.3f;
-  const uint64_t seed     = 444ULL;
+  uint64_t seed           = 444ULL;
+  if (const char* e = std::getenv("SPECTRAL_DIAG_SEED")) seed = std::strtoull(e, nullptr, 10);
 
   raft::resources handle;
   cudaStream_t stream = raft::resource::get_cuda_stream(handle).get();
