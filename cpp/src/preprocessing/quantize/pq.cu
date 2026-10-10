@@ -88,7 +88,9 @@ auto train_from_rows(raft::resources const& res,
 {
   cudaPointerAttributes ptr_attrs;
   RAFT_CUDA_TRY(cudaPointerGetAttributes(&ptr_attrs, src_ptr));
-  auto const* device_ptr = reinterpret_cast<T const*>(ptr_attrs.devicePointer);
+  auto const* device_ptr = cuvs::spatial::knn::detail::utils::is_device_accessible(ptr_attrs)
+                             ? reinterpret_cast<T const*>(ptr_attrs.devicePointer)
+                             : nullptr;
   if (device_ptr == nullptr) {
     // A host mdspan makes training subsample the rows and encoding stream them in bounded batches,
     // so the dense dataset is never staged on the device.

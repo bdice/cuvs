@@ -45,6 +45,43 @@ enum class pointer_residency {
   device_only
 };
 
+/**
+ * Whether the device behind the current context reads pageable (unregistered) host memory through
+ * the host page tables (ATS, e.g. Grace Hopper).
+ *
+ * On systems with HMM, `cudaPointerGetAttributes` also reports a non-null `devicePointer` for
+ * pageable host memory, but device accesses to such memory are serviced through GPU page faults
+ * that migrate the pages to device memory. That path is slow and races with the host using or
+ * freeing the memory while asynchronous work is still in flight, so pageable memory is only
+ * treated as device-accessible when it is accessed through ATS.
+ */
+inline auto pageable_memory_uses_host_page_tables() -> bool
+{
+  int dev_id     = 0;
+  int uses_table = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&dev_id));
+  RAFT_CUDA_TRY(
+    cudaDeviceGetAttribute(&uses_table, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev_id));
+  return uses_table != 0;
+}
+
+/**
+ * Whether a pointer described by `attr` can be dereferenced in device code.
+ *
+ * Pageable host memory (`cudaMemoryTypeUnregistered`) counts as device-accessible only on systems
+ * where the device reads it through the host page tables, see
+ * `pageable_memory_uses_host_page_tables`.
+ */
+inline auto is_device_accessible(const cudaPointerAttributes& attr) -> bool
+{
+  switch (attr.type) {
+    case cudaMemoryTypeDevice:
+    case cudaMemoryTypeManaged: return true;
+    case cudaMemoryTypeHost: return attr.devicePointer != nullptr;
+    default: return attr.devicePointer != nullptr && pageable_memory_uses_host_page_tables();
+  }
+}
+
 template <typename... Types>
 struct pointer_residency_count {};
 
@@ -60,7 +97,7 @@ struct pointer_residency_count<Type, Types...> {
     auto [on_device, on_host] = pointer_residency_count<Types...>::run(ptrs...);
     cudaPointerAttributes attr;
     RAFT_CUDA_TRY(cudaPointerGetAttributes(&attr, ptr));
-    if (attr.devicePointer || attr.type == cudaMemoryTypeDevice) { ++on_device; }
+    if (is_device_accessible(attr)) { ++on_device; }
     if (attr.hostPointer || attr.type == cudaMemoryTypeUnregistered) { ++on_host; }
     return std::make_tuple(on_device, on_host);
   }
