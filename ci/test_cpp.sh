@@ -52,6 +52,12 @@ EXITCODE=0
 trap "EXITCODE=1" ERR
 set +e
 
+# Run the k-means test binaries once in full.
+rapids-logger "Run k-means test binaries"
+pushd "$CONDA_PREFIX"/bin/gtests/libcuvs
+timeout -v --signal=SIGINT --kill-after=60s 60m ctest -j4 --output-on-failure -R "^(CLUSTER_TEST|CLUSTER_KMEANS_MG_TEST|CLUSTER_KMEANS_MNMG_TEST|KMEANS_C_TEST|KMEANS_MG_C_TEST)$"
+popd
+
 # Repeat the k-means fit tests to measure their failure rate.
 rapids-logger "Run k-means fit tests repeatedly"
 pushd "$CONDA_PREFIX"/bin/gtests/libcuvs
