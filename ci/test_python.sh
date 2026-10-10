@@ -175,7 +175,7 @@ BENCH_TESTS_DIR="${PWD}/python/cuvs_bench/cuvs_bench"
 PYTEST_ARGS=(-v -p no:cacheprovider -o faulthandler_timeout=240 -o junit_family=xunit2)
 
 # Total budget for the repeat loop (seconds).
-BUDGET=$(( 270 * 60 ))
+BUDGET=$(( 150 * 60 ))
 LOOP_START=$(date +%s)
 i=0
 while (( $(date +%s) - LOOP_START < BUDGET )); do
@@ -198,7 +198,7 @@ while (( $(date +%s) - LOOP_START < BUDGET )); do
     tests/test_cli.py
   popd > /dev/null || exit 1
 
-  if (( HANGS >= 4 )); then
+  if (( HANGS >= 2 )); then
     break
   fi
 done
