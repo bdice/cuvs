@@ -44,7 +44,7 @@ CUVS_EXPORT void index<T, IdxT, DatasetViewT>::compute_dataset_norms_(raft::reso
 
   if constexpr (nb::is_padded_dataset_view_v<DatasetViewT> ||
                 nb::is_standard_dataset_view_v<DatasetViewT>) {
-    rm_dataset = dataset_.view();
+    rm_dataset = nb::dense_row_major_view(dataset_);
   } else if constexpr (nb::is_vpq_dataset_view_v<DatasetViewT> ||
                        nb::is_bbq_dataset_view_v<DatasetViewT>) {
     skip_norms = true;
@@ -320,10 +320,10 @@ auto build(raft::resources const& res, const index_params& params, DatasetViewT 
     RAFT_EXPECTS(effective_params.metric == cuvs::distance::DistanceType::L2Expanded,
                  "cagra::build: a VPQ dataset supports only L2Expanded distance");
     RAFT_EXPECTS(dataset.n_rows() > 0, "cagra::build: VPQ dataset must not be empty");
-    RAFT_EXPECTS(dataset.dset().pq_bits() == 8,
+    RAFT_EXPECTS(dataset.manifest_view().pq_bits() == 8,
                  "cagra::build: VPQ dataset requires pq_bits == 8, got %u",
-                 dataset.dset().pq_bits());
-    auto const pq_len = dataset.dset().pq_len();
+                 dataset.manifest_view().pq_bits());
+    auto const pq_len = dataset.manifest_view().pq_len();
     RAFT_EXPECTS(pq_len == 2 || pq_len == 4 || pq_len == 8,
                  "cagra::build: VPQ dataset requires pq_len in {2, 4, 8}, got %u",
                  pq_len);
@@ -420,15 +420,27 @@ void search_with_filtering(raft::resources const& res,
     res, params, idx, queries, neighbors, distances, sample_filter);
 }
 
-namespace detail {
-/** Clamp a filtering rate derived from a filter to the range the search plan accepts. */
-inline float clamp_filtering_rate(float filtering_rate)
+/**
+ * Fraction of rows removed by per-partition bitsets (one bitset per partition; an empty view means
+ * the partition is unfiltered), clamped to [0, 0.999] so the plan's itopk scaling stays finite.
+ */
+inline float bitset_filtering_rate(
+  raft::resources const& res,
+  const std::vector<int64_t>& partition_rows,
+  const std::vector<cuvs::core::bitset_view<std::uint32_t, int64_t>>& partition_bitsets)
 {
-  const float min_filtering_rate = 0.0f;
-  const float max_filtering_rate = 0.999f;
-  return std::min(std::max(filtering_rate, min_filtering_rate), max_filtering_rate);
+  int64_t total_rows = 0;
+  int64_t kept_rows  = 0;
+  for (size_t i = 0; i < partition_rows.size(); i++) {
+    total_rows += partition_rows[i];
+    const bool filtered = i < partition_bitsets.size() && partition_bitsets[i].data() != nullptr &&
+                          partition_bitsets[i].size() > 0;
+    kept_rows +=
+      filtered ? static_cast<int64_t>(partition_bitsets[i].count(res)) : partition_rows[i];
+  }
+  const float rate = static_cast<float>(total_rows - kept_rows) / static_cast<float>(total_rows);
+  return std::min(std::max(rate, 0.0f), 0.999f);
 }
-}  // namespace detail
 
 template <typename T,
           typename IdxT,
@@ -459,9 +471,8 @@ void search(raft::resources const& res,
         sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) {
-      const auto num_set_bits = sample_filter.bitset_view_.count(res);
-      auto filtering_rate = (float)(idx.dataset().n_rows() - num_set_bits) / idx.dataset().n_rows();
-      params_copy.filtering_rate = detail::clamp_filtering_rate(filtering_rate);
+      params_copy.filtering_rate = bitset_filtering_rate(
+        res, {static_cast<int64_t>(idx.dataset().n_rows())}, {sample_filter.bitset_view_});
     }
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(
@@ -510,7 +521,13 @@ void search(raft::resources const& res,
       dynamic_cast<const cuvs::neighbors::filtering::udf_filter&>(sample_filter_ref);
     search_params params_copy = params;
     if (params.filtering_rate < 0.0) {
-      params_copy.filtering_rate = detail::clamp_filtering_rate(sample_filter.filtering_rate);
+      const float min_filtering_rate = 0.0f;
+      const float max_filtering_rate = 0.999f;
+      params_copy.filtering_rate =
+        sample_filter.filtering_rate < 0.0f
+          ? 0.0f
+          : std::min(std::max(sample_filter.filtering_rate, min_filtering_rate),
+                     max_filtering_rate);
     }
     auto sample_filter_copy = sample_filter;
     return search_with_filtering<T, IdxT, decltype(sample_filter_copy), OutputIdxT, DatasetViewT>(
@@ -599,39 +616,23 @@ void search(
     }
   }
 
+  search_params params_copy = params;
+  if (params_copy.filtering_rate < 0.0f) {
+    std::vector<int64_t> partition_rows;
+    for (const auto* idx : indices) {
+      partition_rows.push_back(static_cast<int64_t>(idx->size()));
+    }
+    params_copy.filtering_rate = bitset_filtering_rate(res, partition_rows, partition_bitsets);
+  }
+
   if (rep == nullptr) {
     cagra::detail::search_multi_partition<T,
                                           OutputIdxT,
                                           IdxT,
                                           float,
                                           cuvs::neighbors::filtering::none_sample_filter>(
-      res, params, indices, queries, partition_ids, neighbors, distances, partition_bitsets);
+      res, params_copy, indices, queries, partition_ids, neighbors, distances, partition_bitsets);
   } else {
-    // As in the single-partition bitset path, derive the filtering rate from the bitsets when the
-    // caller did not set one, so that the search plan enlarges itopk_size for selective filters.
-    // Without this, a selective filter leaves too few valid candidates and the search can return
-    // fewer than k neighbors. One plan serves every partition, so size it for the most selective
-    // partition that still accepts at least one row; a partition that accepts nothing contributes
-    // no neighbors whatever the itopk_size, and an unfiltered partition has a rate of zero.
-    search_params params_copy = params;
-    if (params.filtering_rate < 0.0) {
-      float filtering_rate = 0.0f;
-      for (size_t i = 0; i < partition_bitsets.size() && i < indices.size(); i++) {
-        const auto& v = partition_bitsets[i];
-        if (v.data() == nullptr || v.size() == 0) { continue; }
-        const int64_t n_rows = indices[i]->dataset().n_rows();
-        if (n_rows == 0) { continue; }
-        // Count only this partition's rows; the bitset may be padded past n_rows.
-        const auto num_set_bits =
-          cuvs::core::bitset_view<std::uint32_t, int64_t>(const_cast<std::uint32_t*>(v.data()),
-                                                          std::min<int64_t>(n_rows, v.size()))
-            .count(res);
-        if (num_set_bits == 0) { continue; }
-        filtering_rate =
-          std::max(filtering_rate, static_cast<float>(n_rows - num_set_bits) / n_rows);
-      }
-      params_copy.filtering_rate = detail::clamp_filtering_rate(filtering_rate);
-    }
     using bitset_filter_t = cuvs::neighbors::filtering::bitset_filter<std::uint32_t, int64_t>;
     cagra::detail::search_multi_partition<T, OutputIdxT, IdxT, float, bitset_filter_t>(
       res,
