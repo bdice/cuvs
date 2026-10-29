@@ -27,6 +27,7 @@ jobs:
       - conda-java-tests
       - conda-lucene-build
       - conda-lucene-tests
+      - conda-lucene-tests-min-jdk
       - rust-build
       - go-build
       - docs-build
@@ -35,24 +36,12 @@ jobs:
       - wheel-build-cuvs
       - wheel-tests-cuvs
       - devcontainer
-      - telemetry-setup
     uses: rapidsai/shared-workflows/.github/workflows/pr-builder.yaml@main
     permissions:
       contents: read
     if: always()
     with:
       needs: ${{ toJSON(needs) }}
-  telemetry-setup:
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      OTEL_SERVICE_NAME: 'pr-cuvs'
-    steps:
-      - name: Telemetry setup
-        if: ${{ vars.TELEMETRY_ENABLED == 'true' }}
-        uses: rapidsai/shared-actions/telemetry-dispatch-stash-base-env-vars@main
   build-details:
     uses: rapidsai/shared-workflows/.github/workflows/compute-build-details.yaml@main
   check-nightly-ci:
@@ -75,7 +64,6 @@ jobs:
           target-branch: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}
           max-days-without-success: 30
   changed-files:
-    needs: telemetry-setup
     permissions:
       actions: read
       contents: read
@@ -430,16 +418,23 @@ jobs:
           - '!python/**'
           - '!rust/**'
           - '!thirdparty/LICENSES/**'
+        devcontainer_build_inputs:
+          - '.devcontainer/**'
+          - '.github/workflows/pr.yaml'
+          - 'RAPIDS_BRANCH'
+          - 'c/**'
+          - 'cmake/**'
+          - 'cpp/**'
+          - 'dependencies.yaml'
+          - 'python/**'
+          - '!**/*.md'
   checks:
-    needs: telemetry-setup
     uses: rapidsai/shared-workflows/.github/workflows/checks.yaml@main
     permissions:
       contents: read
     with:
       enable_check_generated_files: false
-      ignored_pr_jobs: "telemetry-summarize"
   check-c-abi:
-    needs: telemetry-setup
     permissions:
       actions: read
       contents: read
@@ -489,7 +484,8 @@ jobs:
       build_type: pull-request
       script: "ci/test_cpp.sh ${{ matrix.shard }} ${{ matrix.num_shards }}"
       cache-paths: .cache/cuda-jit
-      cache-key-prefix: libcuvs-cudajit-v1
+      # One cache per test shard: each shard links a different set of kernels.
+      cache-key-prefix: libcuvs-cudajit-v1-shard${{ matrix.shard }}of${{ matrix.num_shards }}
       # Caches are immutable. Re-key when the JIT-relevant sources change so a completed run can
       # save newly compiled entries; restore a compatible earlier archive first.
       cache-key-files: |
@@ -635,7 +631,7 @@ jobs:
       matrix_filter: map(select(.ARCH == "amd64"))
       script: "ci/build_lucene.sh"
       artifact-name-prefix: "cuvs-lucene"
-      file_to_upload: "java/cuvs-lucene/target/"
+      file_to_upload: "java/cuvs-lucene/*/target/"
   conda-lucene-tests:
     needs: conda-lucene-build
     permissions:
@@ -648,6 +644,27 @@ jobs:
     with:
       build_type: pull-request
       script: "ci/test_lucene.sh"
+  conda-lucene-tests-min-jdk:
+    # Verifies that cuvs-lucene loads and works without the GPU on the oldest JDK it supports
+    # (java_min_jdk in dependencies.yaml), by running its test suite against the amd64-built
+    # classes without recompiling -- see ci/test_lucene.sh. It runs once, not per CUDA version: it
+    # uses no GPU, so the artifacts of any amd64 entry of the build matrix will do. This matters
+    # because many applications built on Lucene support older JDKs than the 22 that cuvs-java needs
+    # for the GPU. cuvs-lucene can't stop such an application from starting on an older JDK, so
+    # there it has to load and fall back to the CPU.
+    needs: conda-lucene-build
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: read
+      pull-requests: read
+    uses: ./.github/workflows/matrix-job.yaml
+    with:
+      build_type: pull-request
+      node_type: cpu8
+      matrix_filter: '[map(select(.ARCH == "amd64")) | max_by(.CUDA_VER | split(".") | map(tonumber))]'
+      script: "ci/test_lucene.sh --min-jdk"
   rust-build:
     needs: [conda-cpp-build, changed-files]
     permissions:
@@ -688,7 +705,7 @@ jobs:
       build_type: pull-request
       matrix_name: docs-build
   docs-build:
-    needs: [docs-build-matrix]
+    needs: [docs-build-matrix, changed-files]
     permissions:
       actions: read
       contents: read
@@ -767,7 +784,8 @@ jobs:
       packages: read
       pull-requests: read
     secrets: inherit # zizmor: ignore[secrets-inherit]
-    needs: telemetry-setup
+    needs: [changed-files]
+    if: fromJSON(needs.changed-files.outputs.changed_file_groups).devcontainer_build_inputs
     uses: rapidsai/shared-workflows/.github/workflows/build-in-devcontainer.yaml@main
     with:
       arch: '["amd64", "arm64"]'
@@ -779,18 +797,5 @@ jobs:
         SCCACHE_DIST_FALLBACK_TO_LOCAL_COMPILE=false
       build_command: |
         sccache --zero-stats;
-        build-all -j0 --verbose 2>&1 | tee telemetry-artifacts/build.log;
-        sccache --show-adv-stats | tee telemetry-artifacts/sccache-stats.txt;
-  telemetry-summarize:
-    # This job must use a self-hosted runner to record telemetry traces.
-    runs-on: linux-amd64-cpu4
-    needs: pr-builder
-    permissions:
-      actions: write
-    if: ${{ vars.TELEMETRY_ENABLED == 'true' && !cancelled() }}
-    continue-on-error: true
-    steps:
-      - name: Telemetry summarize
-        uses: rapidsai/shared-actions/telemetry-dispatch-summarize@main
-    env:
-      GH_TOKEN: ${{ github.token }}
+        build-all -j0 --verbose;
+        sccache --show-adv-stats;
