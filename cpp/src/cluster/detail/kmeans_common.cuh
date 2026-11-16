@@ -725,12 +725,15 @@ void compute_centroid_adjustments(
                                    stream,
                                    reset_sums);
 
-  raft::linalg::reduce_cols_by_key(sample_weights.data_handle(),
-                                   cluster_labels,
-                                   weight_per_cluster.data_handle(),
+  rmm::device_uvector<char> pr2801_ws(n_samples, stream);
+  raft::linalg::reduce_rows_by_key(sample_weights.data_handle(),
                                    static_cast<IndexT>(1),
+                                   cluster_labels,
+                                   pr2801_ws.data(),
                                    static_cast<IndexT>(n_samples),
+                                   static_cast<IndexT>(1),
                                    n_clusters,
+                                   weight_per_cluster.data_handle(),
                                    stream,
                                    reset_sums);
 }
